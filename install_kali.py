@@ -124,11 +124,6 @@ def list_instance_ids() -> list[str]:
     return sorted(load_instances().get("instances", {}).keys())
 
 
-def get_active_instance_id() -> str:
-    data = load_instances()
-    return data.get("active") or "default"
-
-
 def get_instance_cfg(instance_id: str) -> dict[str, str]:
     data = load_instances()
     inst = data["instances"].get(instance_id)
@@ -533,6 +528,11 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
                 cfg["CURSOR_AUTH_TOKEN"] = args.auth_token
             if args.worker_dir_in_container:
                 cfg["CURSOR_WORKER_DIR"] = args.worker_dir_in_container
+            if getattr(args, "kali_profile", None):
+                profile = args.kali_profile
+                _, meta = KALI_PROFILES.get(profile, KALI_PROFILES["minimal"])
+                cfg["KALI_PROFILE"] = profile
+                cfg["KALI_METAPACKAGE"] = meta
             return cfg
 
     worker_dir = pick("WORKER_DIR", args.worker_dir, str(ROOT))
@@ -659,22 +659,31 @@ def auth_volume_name(container_name: str) -> str:
 def login_auth_volumes_populated(docker: str, container_name: str) -> bool:
     """Verifica se volumes de login têm conteúdo (sem subir container Kali)."""
     for vol in (auth_home_volume_name(container_name), auth_config_volume_name(container_name)):
-        result = run(
+        exists = run(
             docker,
-            ["volume", "inspect", "-f", "{{.Mountpoint}}", vol],
+            ["volume", "inspect", vol],
             capture=True,
             check=False,
         )
-        if result.returncode != 0:
+        if exists.returncode != 0:
             continue
-        mount = Path((result.stdout or "").strip())
-        if not mount.is_dir():
-            continue
-        try:
-            if any(mount.iterdir()):
-                return True
-        except OSError:
-            continue
+        check = run(
+            docker,
+            [
+                "run",
+                "--rm",
+                "-v",
+                f"{vol}:/check:ro",
+                "alpine",
+                "sh",
+                "-c",
+                "ls -A /check 2>/dev/null | head -1",
+            ],
+            capture=True,
+            check=False,
+        )
+        if check.returncode == 0 and (check.stdout or "").strip():
+            return True
     return False
 
 
