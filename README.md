@@ -10,10 +10,10 @@ Documentação oficial do worker: [My Machines | Cursor Docs](https://cursor.com
 
 ## O que este repositório faz
 
-1. Constrói uma imagem baseada em `kalilinux/kali-rolling`
-2. Instala dependências (`git`, `curl`, etc.) e o **Cursor CLI** (`agent`) no primeiro start
-3. Sobe um container persistente com seu diretório de trabalho montado em `/workspace`
-4. Executa `agent worker start --name <WORKER_NAME>` para registrar a máquina no Cursor
+1. Faz `docker pull` da imagem oficial [`kalilinux/kali-rolling`](https://hub.docker.com/r/kalilinux/kali-rolling)
+2. Monta `scripts/entrypoint.sh` no container (sem rebuild do Kali)
+3. Instala dependências mínimas (`curl`, `git`, etc.) e o **Cursor CLI** (`agent`) no primeiro start
+4. Sobe um container persistente com seu diretório em `/workspace` e executa `agent worker start --name <WORKER_NAME>`
 
 ## Pré-requisitos
 
@@ -28,10 +28,18 @@ Documentação oficial do worker: [My Machines | Cursor Docs](https://cursor.com
 ## Início rápido
 
 ```bash
-# 1. Configurar variáveis (opcional se usar login interativo)
+# Menu interativo (recomendado) — múltiplas instâncias, perfil Kali, auth
+python install_kali.py
+
+# Ou explicitamente:
+python install_kali.py menu
+```
+
+```bash
+# 1. Configurar variáveis (opcional; o menu também grava em instances.json)
 cp .env.example .env
 
-# 2. Instalar — o script pergunta como autenticar se necessário
+# 2. Instalar via CLI direto
 python install_kali.py install
 
 # Alternativa A: API key direto
@@ -51,13 +59,31 @@ python install_kali.py status
 
 No [cursor.com/agents](https://cursor.com/agents), a máquina deve aparecer com o nome definido em `WORKER_NAME`.
 
+## Múltiplas instâncias Kali
+
+Cada instância tem container, worker name, diretório, perfil e auth próprios — salvo em `instances.json` (não versionado).
+
+| Perfil | Conteúdo |
+|--------|----------|
+| `minimal` | curl, git + Cursor agent |
+| `headless` | `kali-linux-headless` |
+| `large` | `kali-linux-large` |
+
+```bash
+python install_kali.py list
+python install_kali.py status -i pentest-01
+python install_kali.py restart -i lab-red
+```
+
+Modelo: `instances.json.example`
+
 ## Configuração (`.env`)
 
 | Variável | Descrição | Padrão |
 |----------|-----------|--------|
 | `WORKER_NAME` | Nome do worker (`--name`) no Cursor | `kali-docker-worker` |
 | `CONTAINER_NAME` | Nome do container Docker | `kali-cursor-worker` |
-| `IMAGE_NAME` | Tag da imagem local | `kali-cursor-worker:latest` |
+| `IMAGE_NAME` | Imagem Docker | `kalilinux/kali-rolling:latest` |
 | `WORKER_DIR` | Pasta do host montada em `/workspace` | diretório do projeto |
 | `CURSOR_API_KEY` | API key para autenticação automática | (vazio) |
 | `CURSOR_WORKER_DIR` | Caminho dentro do container | `/workspace` |
@@ -73,8 +99,12 @@ python install_kali.py install --api-key "$env:CURSOR_API_KEY"
 
 | Comando | Ação |
 |---------|------|
-| `install` | Build da imagem + start do container + worker (padrão) |
-| `build` | Apenas constrói a imagem Docker |
+| *(sem args)* / `menu` | Menu CLI: nova instância, gerenciar, auth, perfis |
+| `list` | Lista instâncias registradas |
+| `install` | Pull da imagem oficial + start do container + worker |
+| `-i`, `--instance` | ID em `instances.json` (ex: `-i pentest-01`) |
+| `pull` | Apenas `docker pull kalilinux/kali-rolling` |
+| `build` | Alias de `pull` (imagem oficial) |
 | `start` | Inicia container existente ou cria um novo |
 | `stop` | Para o container |
 | `restart` | Para e inicia novamente |
@@ -87,7 +117,7 @@ python install_kali.py install --api-key "$env:CURSOR_API_KEY"
 
 ```bash
 cp .env.example .env
-docker compose build
+docker compose pull
 docker compose up -d
 docker compose logs -f
 ```
@@ -116,8 +146,7 @@ python install_kali.py install --non-interactive --api-key "$CURSOR_API_KEY"
 ```
 teste-kali/
 ├── install_kali.py      # Orquestrador cross-platform (host)
-├── Dockerfile           # Imagem Kali + entrypoint
-├── docker-compose.yml
+├── docker-compose.yml   # Usa kalilinux/kali-rolling oficial
 ├── scripts/entrypoint.sh
 ├── docs/INSTALACAO.md   # Passo a passo detalhado
 ├── .env.example

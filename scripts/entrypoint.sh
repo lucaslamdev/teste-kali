@@ -4,9 +4,36 @@ set -euo pipefail
 WORKER_NAME="${WORKER_NAME:-kali-docker-worker}"
 WORKER_DIR="${CURSOR_WORKER_DIR:-/workspace}"
 AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+KALI_METAPACKAGE="${KALI_METAPACKAGE:-}"
 
 log() {
   printf '[entrypoint] %s\n' "$*"
+}
+
+ensure_os_packages() {
+  if command -v curl >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  log "Instalando dependências na imagem oficial (curl, git, ca-certificates)..."
+  apt-get update -qq
+  apt-get install -y --no-install-recommends curl git ca-certificates procps
+  rm -rf /var/lib/apt/lists/*
+}
+
+ensure_kali_metapackage() {
+  if [[ -z "$KALI_METAPACKAGE" ]]; then
+    return 0
+  fi
+  if dpkg -s "$KALI_METAPACKAGE" >/dev/null 2>&1; then
+    log "Metapacote $KALI_METAPACKAGE já instalado."
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  log "Instalando metapacote Kali: $KALI_METAPACKAGE (pode demorar)..."
+  apt-get update -qq
+  apt-get install -y "$KALI_METAPACKAGE"
+  rm -rf /var/lib/apt/lists/*
 }
 
 ensure_agent_cli() {
@@ -63,24 +90,25 @@ build_worker_cmd() {
   printf '%s\n' "${cmd[@]}"
 }
 
-# Modo login: apenas instala CLI e abre agent login (interativo)
 if [[ "${CURSOR_AUTH_MODE:-}" == "login" ]]; then
+  ensure_os_packages
   ensure_agent_cli
   log "Iniciando login do Cursor (siga o link no navegador)..."
   exec "$(agent_bin)" login
 fi
 
-log "Iniciando Kali Cursor Worker"
+log "Iniciando Kali Cursor Worker (kalilinux/kali-rolling)"
 log "  WORKER_NAME=$WORKER_NAME"
 log "  WORKER_DIR=$WORKER_DIR"
+[[ -n "$KALI_METAPACKAGE" ]] && log "  KALI_METAPACKAGE=$KALI_METAPACKAGE"
 
+ensure_os_packages
+ensure_kali_metapackage
 ensure_agent_cli
 
 if ! is_authenticated; then
   log "ERRO: Autenticação necessária para o worker."
-  log "  Opção 1 — No host: python install_kali.py login"
-  log "  Opção 2 — No host: defina CURSOR_API_KEY no .env e rode install novamente"
-  log "  Opção 3 — Dentro do container: agent login"
+  log "  No host: python install_kali.py menu → Gerenciar instância → Autenticação"
   exit 1
 fi
 

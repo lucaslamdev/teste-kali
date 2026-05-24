@@ -1,4 +1,5 @@
 .env
+instances.json
 __pycache__/
 *.pyc
 .Python

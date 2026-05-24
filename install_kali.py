@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -17,10 +19,471 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_IMAGE = "kali-cursor-worker:latest"
+OFFICIAL_IMAGE = "kalilinux/kali-rolling:latest"
+DEFAULT_IMAGE = OFFICIAL_IMAGE
 DEFAULT_CONTAINER = "kali-cursor-worker"
 DEFAULT_WORKER_NAME = "kali-docker-worker"
+ENTRYPOINT_SCRIPT = ROOT / "scripts" / "entrypoint.sh"
 ENV_FILE = ROOT / ".env"
+INSTANCES_FILE = ROOT / "instances.json"
+
+KALI_PROFILES: dict[str, tuple[str, str]] = {
+    "minimal": ("Mínimo (curl, git + Cursor agent)", ""),
+    "headless": ("Kali headless (ferramentas comuns)", "kali-linux-headless"),
+    "large": ("Kali large (conjunto amplo)", "kali-linux-large"),
+}
+
+
+def uses_official_image(image: str) -> bool:
+    base = image.split(":")[0].lower()
+    return base in ("kalilinux/kali-rolling", "docker.io/kalilinux/kali-rolling")
+
+
+def entrypoint_mount_path() -> str:
+    return host_volume_path(str(ENTRYPOINT_SCRIPT))
+
+
+def apt_bootstrap_snippet() -> str:
+    return """
+if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y --no-install-recommends curl git ca-certificates procps
+  rm -rf /var/lib/apt/lists/*
+fi
+"""
+
+
+def cfg_from_instance(inst: dict) -> dict[str, str]:
+    profile = inst.get("kali_profile", "minimal")
+    _, meta = KALI_PROFILES.get(profile, KALI_PROFILES["minimal"])
+    worker_dir = inst.get("worker_dir", str(ROOT))
+    return {
+        "WORKER_NAME": inst.get("worker_name", DEFAULT_WORKER_NAME),
+        "CONTAINER_NAME": inst.get("container_name", DEFAULT_CONTAINER),
+        "IMAGE_NAME": inst.get("image_name", OFFICIAL_IMAGE),
+        "WORKER_DIR": str(Path(worker_dir).expanduser().resolve()),
+        "CURSOR_API_KEY": inst.get("cursor_api_key", ""),
+        "CURSOR_AUTH_TOKEN": inst.get("cursor_auth_token", ""),
+        "CURSOR_WORKER_DIR": inst.get("cursor_worker_dir", "/workspace"),
+        "KALI_PROFILE": profile,
+        "KALI_METAPACKAGE": meta,
+        "_instance_id": inst.get("id", ""),
+    }
+
+
+def default_instance_record(instance_id: str = "default") -> dict:
+    env = load_dotenv(ENV_FILE)
+    profile = env.get("KALI_PROFILE", "minimal")
+    if profile not in KALI_PROFILES:
+        profile = "minimal"
+    return {
+        "id": instance_id,
+        "container_name": env.get("CONTAINER_NAME", DEFAULT_CONTAINER),
+        "worker_name": env.get("WORKER_NAME", DEFAULT_WORKER_NAME),
+        "worker_dir": env.get("WORKER_DIR", str(ROOT)),
+        "image_name": env.get("IMAGE_NAME", OFFICIAL_IMAGE),
+        "kali_profile": profile,
+        "cursor_api_key": env.get("CURSOR_API_KEY", ""),
+        "cursor_auth_token": env.get("CURSOR_AUTH_TOKEN", ""),
+        "cursor_worker_dir": env.get("CURSOR_WORKER_DIR", "/workspace"),
+        "auth_mode": "api_key" if env.get("CURSOR_API_KEY") else "login",
+    }
+
+
+def load_instances() -> dict:
+    if INSTANCES_FILE.is_file():
+        data = json.loads(INSTANCES_FILE.read_text(encoding="utf-8"))
+        if "instances" in data:
+            return data
+    # Migra .env legado para instância default
+    data = {
+        "active": "default",
+        "instances": {"default": default_instance_record("default")},
+    }
+    save_instances(data)
+    return data
+
+
+def save_instances(data: dict) -> None:
+    INSTANCES_FILE.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_instance_record(instance_id: str, record: dict) -> None:
+    data = load_instances()
+    record["id"] = instance_id
+    data["instances"][instance_id] = record
+    data["active"] = instance_id
+    save_instances(data)
+
+
+def list_instance_ids() -> list[str]:
+    return sorted(load_instances().get("instances", {}).keys())
+
+
+def get_instance_cfg(instance_id: str) -> dict[str, str]:
+    data = load_instances()
+    inst = data["instances"].get(instance_id)
+    if not inst:
+        raise KeyError(f"Instância '{instance_id}' não encontrada.")
+    return cfg_from_instance(inst)
+
+
+def discover_docker_kali_containers(docker: str) -> list[str]:
+    result = run(
+        docker,
+        ["ps", "-a", "--format", "{{.Names}}"],
+        capture=True,
+    )
+    names = [n.strip() for n in (result.stdout or "").splitlines() if n.strip()]
+    return [n for n in names if n.startswith("kali-") or n == DEFAULT_CONTAINER]
+
+
+def container_env_map(docker: str, name: str) -> dict[str, str]:
+    if not container_exists(docker, name):
+        return {}
+    try:
+        result = run(
+            docker,
+            ["inspect", name, "--format", "{{json .Config.Env}}"],
+            capture=True,
+        )
+        raw = json.loads(result.stdout or "[]")
+        env: dict[str, str] = {}
+        for item in raw:
+            if "=" in item:
+                k, _, v = item.partition("=")
+                env[k] = v
+        return env
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return {}
+
+
+def instance_runtime_status(docker: str, cfg: dict[str, str]) -> dict:
+    name = cfg["CONTAINER_NAME"]
+    running = container_running(docker, name)
+    exists = container_exists(docker, name)
+    env = container_env_map(docker, name) if exists else {}
+    return {
+        "container": name,
+        "running": running,
+        "exists": exists,
+        "env_worker": env.get("WORKER_NAME", ""),
+        "env_profile": env.get("KALI_METAPACKAGE", ""),
+        "auth_volume": auth_volume_name(name),
+    }
+
+
+def print_instance_summary(docker: str, instance_id: str) -> None:
+    cfg = get_instance_cfg(instance_id)
+    rt = instance_runtime_status(docker, cfg)
+    profile_label = KALI_PROFILES.get(cfg["KALI_PROFILE"], ("?", ""))[0]
+    auth = "API key" if cfg.get("CURSOR_API_KEY") else (
+        "login (volume)" if login_auth_volumes_populated(docker, cfg["CONTAINER_NAME"]) else "não configurado"
+    )
+    state = "EM EXECUÇÃO" if rt["running"] else ("PARADO" if rt["exists"] else "NÃO CRIADO")
+    print(f"  [{instance_id}] {cfg['CONTAINER_NAME']} | worker={cfg['WORKER_NAME']}")
+    print(f"           perfil={profile_label} | auth={auth} | {state}")
+    if rt["exists"] and rt["env_worker"] and rt["env_worker"] != cfg["WORKER_NAME"]:
+        print(f"           ⚠ container usa WORKER_NAME={rt['env_worker']} (config: {cfg['WORKER_NAME']})")
+
+
+def cli_ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or default
+
+
+def cli_choose(prompt: str, options: list[tuple[str, str]]) -> str:
+    print(prompt)
+    for key, label in options:
+        print(f"  [{key}] {label}")
+    valid = {k for k, _ in options}
+    while True:
+        choice = input("Escolha: ").strip()
+        if choice in valid:
+            return choice
+        print("Opção inválida.")
+
+
+def prompt_kali_profile() -> str:
+    opts = [(k, v[0]) for k, v in KALI_PROFILES.items()]
+    return cli_choose("\nPerfil Kali:", opts)
+
+
+def prompt_new_instance_id(existing: list[str]) -> str:
+    while True:
+        raw = cli_ask("\nID da instância (ex: pentest-01, lab-red)", "")
+        slug = re.sub(r"[^a-z0-9-]", "-", raw.lower()).strip("-")
+        if not slug:
+            print("ID inválido.")
+            continue
+        if slug in existing:
+            print(f"ID '{slug}' já existe.")
+            continue
+        return slug
+
+
+def flow_create_instance(docker: str) -> None:
+    data = load_instances()
+    existing = list(data["instances"].keys())
+    iid = prompt_new_instance_id(existing)
+    container_name = cli_ask("Nome do container Docker", f"kali-{iid}")
+    worker_name = cli_ask("Nome do worker no Cursor (--name)", iid)
+    worker_dir = cli_ask("Diretório no host (WORKER_DIR)", str(ROOT))
+    profile = prompt_kali_profile()
+
+    print("\nAutenticação Cursor:")
+    auth_choice = cli_choose("", [("1", "API key"), ("2", "Login no navegador (agent login)")])
+
+    record = {
+        "id": iid,
+        "container_name": container_name,
+        "worker_name": worker_name,
+        "worker_dir": worker_dir,
+        "image_name": OFFICIAL_IMAGE,
+        "kali_profile": profile,
+        "cursor_api_key": "",
+        "cursor_auth_token": "",
+        "cursor_worker_dir": "/workspace",
+        "auth_mode": "api_key" if auth_choice == "1" else "login",
+    }
+    save_instance_record(iid, record)
+    cfg = get_instance_cfg(iid)
+
+    if auth_choice == "1":
+        try:
+            cfg["CURSOR_API_KEY"] = prompt_api_key()
+        except ValueError as exc:
+            print(f"Erro: {exc}")
+            return
+        record["auth_mode"] = "api_key"
+        save_key = not is_interactive()
+        if is_interactive():
+            ans = input("Salvar API key nesta instância (instances.json)? [S/n]: ").strip().lower()
+            save_key = ans in ("", "s", "sim", "y", "yes")
+        record["cursor_api_key"] = cfg["CURSOR_API_KEY"] if save_key else ""
+        save_instance_record(iid, record)
+    else:
+        ensure_image(docker, cfg["IMAGE_NAME"])
+        cmd_login(docker, cfg, quiet_success=True)
+        record["auth_mode"] = "login"
+        save_instance_record(iid, record)
+        cfg = get_instance_cfg(iid)
+
+    print(f"\n[install] Instalando instância '{iid}'...")
+    cmd_install(docker, cfg, non_interactive=True)
+    print(f"\n[ok] Instância '{iid}' pronta.")
+
+
+def flow_manage_instance(docker: str, instance_id: str) -> None:
+    while True:
+        cfg = get_instance_cfg(instance_id)
+        rt = instance_runtime_status(docker, cfg)
+        print()
+        print("=" * 60)
+        print(f"  Instância: {instance_id}")
+        print("=" * 60)
+        print_instance_summary(docker, instance_id)
+        print()
+        print("  [1] Instalar / recriar container (install)")
+        print("  [2] Iniciar (start)")
+        print("  [3] Parar (stop)")
+        print("  [4] Reiniciar (restart)")
+        print("  [5] Status detalhado")
+        print("  [6] Logs")
+        print("  [7] Autenticação — API key")
+        print("  [8] Autenticação — agent login")
+        print("  [9] Trocar perfil Kali (minimal/headless/large)")
+        print("  [10] Remover container e registro da instância")
+        print("  [0] Voltar")
+        choice = input("\nEscolha: ").strip()
+
+        if choice == "0":
+            return
+        if choice == "1":
+            cmd_install(docker, cfg, non_interactive=True)
+        elif choice == "2":
+            cfg = ensure_authentication(docker, cfg, non_interactive=False)
+            start_container(docker, cfg)
+        elif choice == "3":
+            stop_container(docker, cfg["CONTAINER_NAME"])
+        elif choice == "4":
+            stop_container(docker, cfg["CONTAINER_NAME"])
+            remove_container(docker, cfg["CONTAINER_NAME"])
+            cfg = ensure_authentication(docker, cfg, non_interactive=False)
+            start_container(docker, cfg)
+        elif choice == "5":
+            show_status(docker, cfg)
+        elif choice == "6":
+            follow = input("Seguir logs em tempo real? [s/N]: ").strip().lower() in ("s", "sim", "y", "yes")
+            show_logs(docker, cfg["CONTAINER_NAME"], follow)
+        elif choice == "7":
+            try:
+                key = prompt_api_key()
+            except ValueError as exc:
+                print(f"Erro: {exc}")
+                continue
+            data = load_instances()
+            rec = data["instances"][instance_id]
+            rec["cursor_api_key"] = key
+            rec["auth_mode"] = "api_key"
+            save_instance_record(instance_id, rec)
+            cfg = get_instance_cfg(instance_id)
+            ans = input("Recriar container agora? [S/n]: ").strip().lower()
+            if ans in ("", "s", "sim", "y", "yes"):
+                stop_container(docker, cfg["CONTAINER_NAME"])
+                remove_container(docker, cfg["CONTAINER_NAME"])
+                start_container(docker, cfg)
+        elif choice == "8":
+            ensure_image(docker, cfg["IMAGE_NAME"])
+            cmd_login(docker, cfg)
+            ans = input("Recriar container com login salvo? [S/n]: ").strip().lower()
+            if ans in ("", "s", "sim", "y", "yes"):
+                data = load_instances()
+                rec = data["instances"][instance_id]
+                rec["auth_mode"] = "login"
+                rec["cursor_api_key"] = ""
+                save_instance_record(instance_id, rec)
+                cfg = get_instance_cfg(instance_id)
+                stop_container(docker, cfg["CONTAINER_NAME"])
+                remove_container(docker, cfg["CONTAINER_NAME"])
+                start_container(docker, cfg)
+        elif choice == "9":
+            profile = prompt_kali_profile()
+            data = load_instances()
+            rec = data["instances"][instance_id]
+            rec["kali_profile"] = profile
+            save_instance_record(instance_id, rec)
+            print("[info] Perfil alterado. Recrie o container (opção 1 ou 4).")
+        elif choice == "10":
+            cfg = get_instance_cfg(instance_id)
+            stop_container(docker, cfg["CONTAINER_NAME"])
+            remove_container(docker, cfg["CONTAINER_NAME"])
+            data = load_instances()
+            data["instances"].pop(instance_id, None)
+            if data.get("active") == instance_id:
+                data["active"] = next(iter(data["instances"]), "")
+            save_instances(data)
+            print(f"[ok] Instância '{instance_id}' removida.")
+            return
+        else:
+            print("Opção inválida.")
+
+
+def flow_import_orphan(docker: str) -> None:
+    known = {load_instances()["instances"][i]["container_name"] for i in list_instance_ids()}
+    orphans = [n for n in discover_docker_kali_containers(docker) if n not in known]
+    if not orphans:
+        print("\nNenhum container Kali órfão encontrado.")
+        return
+    print("\nContainers Kali não registrados:")
+    for i, name in enumerate(orphans, 1):
+        print(f"  [{i}] {name}")
+    raw = input("Importar qual? (número ou 0=cancelar): ").strip()
+    if raw == "0" or not raw.isdigit():
+        return
+    idx = int(raw) - 1
+    if idx < 0 or idx >= len(orphans):
+        print("Índice inválido.")
+        return
+    cname = orphans[idx]
+    existing = list_instance_ids()
+    default_iid = cname.replace("kali-", "", 1) or "imported"
+    while True:
+        raw = cli_ask("ID para esta instância", default_iid)
+        slug = re.sub(r"[^a-z0-9-]", "-", raw.lower()).strip("-")
+        if not slug:
+            print("ID inválido.")
+            continue
+        if slug in existing:
+            print(f"ID '{slug}' já existe.")
+            continue
+        iid = slug
+        break
+    env = container_env_map(docker, cname)
+    record = {
+        "id": iid,
+        "container_name": cname,
+        "worker_name": env.get("WORKER_NAME", iid),
+        "worker_dir": str(ROOT),
+        "image_name": OFFICIAL_IMAGE,
+        "kali_profile": "minimal",
+        "cursor_api_key": "",
+        "cursor_auth_token": "",
+        "cursor_worker_dir": "/workspace",
+        "auth_mode": "login",
+    }
+    if env.get("KALI_METAPACKAGE") == "kali-linux-headless":
+        record["kali_profile"] = "headless"
+    elif env.get("KALI_METAPACKAGE") == "kali-linux-large":
+        record["kali_profile"] = "large"
+    save_instance_record(iid, record)
+    print(f"[ok] Instância '{iid}' importada.")
+
+
+def run_interactive_menu(docker: str) -> None:
+    while True:
+        data = load_instances()
+        active = data.get("active", "default")
+        print()
+        print("=" * 60)
+        print("  Kali Docker + Cursor Worker — Menu")
+        print("=" * 60)
+        print(f"  Instância ativa: {active}")
+        print()
+        ids = list_instance_ids()
+        if ids:
+            print("Instâncias registradas:")
+            for iid in ids:
+                print_instance_summary(docker, iid)
+                if iid == active:
+                    print("           (instância ativa)")
+        else:
+            print("  (nenhuma instância)")
+        print()
+        print("  [1] Nova instância Kali")
+        print("  [2] Gerenciar instância existente")
+        print("  [3] Definir instância ativa")
+        print("  [4] Importar container Kali existente")
+        print("  [5] Baixar imagem oficial (pull)")
+        print("  [0] Sair")
+        choice = input("\nEscolha: ").strip()
+
+        if choice == "0":
+            print("Até logo.")
+            return
+        if choice == "1":
+            flow_create_instance(docker)
+        elif choice == "2":
+            if not ids:
+                print("Crie uma instância primeiro.")
+                continue
+            iid = cli_choose(
+                "\nQual instância?",
+                [(i, load_instances()["instances"][i]["container_name"]) for i in ids],
+            )
+            data["active"] = iid
+            save_instances(data)
+            flow_manage_instance(docker, iid)
+        elif choice == "3":
+            if not ids:
+                print("Nenhuma instância.")
+                continue
+            iid = cli_choose("\nInstância ativa:", [(i, i) for i in ids])
+            data["active"] = iid
+            save_instances(data)
+            print(f"[ok] Ativa: {iid}")
+        elif choice == "4":
+            flow_import_orphan(docker)
+        elif choice == "5":
+            ensure_image(docker, OFFICIAL_IMAGE)
+            print("[ok] Imagem atualizada.")
+        else:
+            print("Opção inválida.")
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -45,7 +508,36 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
             return arg_value
         return os_env.get(key) or file_env.get(key) or default
 
+    instance_id = getattr(args, "instance", None) or ""
+    if instance_id or INSTANCES_FILE.is_file():
+        inst_data = load_instances()
+        iid = instance_id or inst_data.get("active", "")
+        if iid and iid in inst_data.get("instances", {}):
+            cfg = cfg_from_instance(inst_data["instances"][iid])
+            if args.name:
+                cfg["WORKER_NAME"] = args.name
+            if args.container_name:
+                cfg["CONTAINER_NAME"] = args.container_name
+            if args.image:
+                cfg["IMAGE_NAME"] = args.image
+            if args.worker_dir:
+                cfg["WORKER_DIR"] = str(Path(args.worker_dir).expanduser().resolve())
+            if args.api_key:
+                cfg["CURSOR_API_KEY"] = args.api_key
+            if args.auth_token:
+                cfg["CURSOR_AUTH_TOKEN"] = args.auth_token
+            if args.worker_dir_in_container:
+                cfg["CURSOR_WORKER_DIR"] = args.worker_dir_in_container
+            if getattr(args, "kali_profile", None):
+                profile = args.kali_profile
+                _, meta = KALI_PROFILES.get(profile, KALI_PROFILES["minimal"])
+                cfg["KALI_PROFILE"] = profile
+                cfg["KALI_METAPACKAGE"] = meta
+            return cfg
+
     worker_dir = pick("WORKER_DIR", args.worker_dir, str(ROOT))
+    profile = pick("KALI_PROFILE", getattr(args, "kali_profile", None), "minimal")
+    _, meta = KALI_PROFILES.get(profile, KALI_PROFILES["minimal"])
     return {
         "WORKER_NAME": pick("WORKER_NAME", args.name, DEFAULT_WORKER_NAME),
         "CONTAINER_NAME": pick("CONTAINER_NAME", args.container_name, DEFAULT_CONTAINER),
@@ -54,6 +546,9 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
         "CURSOR_API_KEY": pick("CURSOR_API_KEY", args.api_key, ""),
         "CURSOR_AUTH_TOKEN": pick("CURSOR_AUTH_TOKEN", args.auth_token, ""),
         "CURSOR_WORKER_DIR": pick("CURSOR_WORKER_DIR", args.worker_dir_in_container, "/workspace"),
+        "KALI_PROFILE": profile,
+        "KALI_METAPACKAGE": meta,
+        "_instance_id": "",
     }
 
 
@@ -157,6 +652,32 @@ def auth_config_volume_name(container_name: str) -> str:
     return f"{container_name}-cursor-auth-config"
 
 
+def auth_volume_name(container_name: str) -> str:
+    return auth_home_volume_name(container_name)
+
+
+def login_auth_volumes_populated(docker: str, container_name: str) -> bool:
+    """Verifica se volumes de login têm conteúdo (sem subir container)."""
+    for vol in (auth_home_volume_name(container_name), auth_config_volume_name(container_name)):
+        result = run(
+            docker,
+            ["volume", "inspect", "-f", "{{.Mountpoint}}", vol],
+            capture=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        mount = Path((result.stdout or "").strip())
+        if not mount.is_dir():
+            continue
+        try:
+            if any(mount.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -235,14 +756,17 @@ def is_agent_authenticated(docker: str, cfg: dict[str, str]) -> bool:
     if has_credentials(cfg):
         return True
 
-    script = """
-set -e
+    script = (
+        "set -e\n"
+        + apt_bootstrap_snippet()
+        + """
 AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
 if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
 "$AGENT_BIN" status
 """
+    )
     result = run_agent_in_container(docker, cfg, script, interactive=False)
     if result is None:
         return False
@@ -302,14 +826,17 @@ def cmd_login(docker: str, cfg: dict[str, str], *, quiet_success: bool = False) 
     print("Quando aparecer o link, abra no navegador e conclua a autorização.")
     print()
 
-    login_script = """
-set -e
+    login_script = (
+        "set -e\n"
+        + apt_bootstrap_snippet()
+        + """
 AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
 if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
 exec "$AGENT_BIN" login
 """
+    )
     result = run_agent_in_container(docker, cfg, login_script, interactive=True)
     if result is None:
         raise RuntimeError("Falha ao executar login.")
@@ -363,10 +890,7 @@ def ensure_authentication(
         return cfg
 
     # choice == "2"
-    try:
-        run(docker, ["image", "inspect", cfg["IMAGE_NAME"]], capture=True)
-    except subprocess.CalledProcessError:
-        build_image(docker, cfg["IMAGE_NAME"])
+    ensure_image(docker, cfg["IMAGE_NAME"])
     cmd_login(docker, cfg, quiet_success=True)
     if not is_agent_authenticated(docker, cfg):
         print("[erro] Login não detectado após agent login.", file=sys.stderr)
@@ -382,9 +906,27 @@ def host_volume_path(path: str) -> str:
     return str(resolved)
 
 
-def build_image(docker: str, image: str) -> None:
-    print(f"[build] Construindo imagem {image}...")
-    run(docker, ["build", "-t", image, str(ROOT)], timeout=None)
+def pull_image(docker: str, image: str) -> None:
+    print(f"[pull] Baixando imagem oficial {image}...")
+    print(f"       Fonte: https://hub.docker.com/r/kalilinux/kali-rolling")
+    run(docker, ["pull", image], timeout=None)
+
+
+def ensure_image(docker: str, image: str) -> None:
+    """Garante que a imagem existe localmente (pull da oficial por padrão)."""
+    if uses_official_image(image):
+        pull_image(docker, image)
+        return
+    try:
+        run(docker, ["image", "inspect", image], capture=True)
+        print(f"[ok] Imagem local encontrada: {image}")
+    except subprocess.CalledProcessError:
+        print(
+            f"Erro: imagem '{image}' não encontrada. "
+            f"Use IMAGE_NAME={OFFICIAL_IMAGE} ou faça docker pull manualmente.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
 
 def start_container(docker: str, cfg: dict[str, str]) -> None:
@@ -422,9 +964,27 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         f"CURSOR_WORKER_DIR={cfg['CURSOR_WORKER_DIR']}",
     ]
     cmd.extend(env_file_args)
+    if cfg.get("KALI_METAPACKAGE"):
+        cmd.extend(["-e", f"KALI_METAPACKAGE={cfg['KALI_METAPACKAGE']}"])
+    if uses_official_image(image):
+        if not ENTRYPOINT_SCRIPT.is_file():
+            print(f"Erro: {ENTRYPOINT_SCRIPT} não encontrado.", file=sys.stderr)
+            raise SystemExit(1)
+        cmd.extend(
+            [
+                "-v",
+                f"{entrypoint_mount_path()}:/usr/local/bin/entrypoint.sh:ro",
+                "-w",
+                "/workspace",
+                "--entrypoint",
+                "/usr/local/bin/entrypoint.sh",
+            ]
+        )
     cmd.append(image)
 
     print(f"[run] Subindo container '{name}' (worker: {cfg['WORKER_NAME']})...")
+    if uses_official_image(image):
+        print(f"       Imagem: {image} (oficial Kali)")
     try:
         run(docker, cmd)
     finally:
@@ -462,7 +1022,11 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     print(f"Container    : {name}")
     print(f"Imagem       : {cfg['IMAGE_NAME']}")
     print(f"Worker name  : {cfg['WORKER_NAME']}")
+    profile = cfg.get("KALI_PROFILE", "minimal")
+    print(f"Perfil Kali  : {KALI_PROFILES.get(profile, ('?', ''))[0]}")
     print(f"Volume host  : {cfg['WORKER_DIR']} -> /workspace")
+    if cfg.get("_instance_id"):
+        print(f"Instância    : {cfg['_instance_id']}")
     if cfg.get("CURSOR_API_KEY"):
         auth_label = "API key (.env/CLI)"
     elif cfg.get("CURSOR_AUTH_TOKEN"):
@@ -487,7 +1051,7 @@ def cmd_install(
     *,
     non_interactive: bool = False,
 ) -> None:
-    build_image(docker, cfg["IMAGE_NAME"])
+    ensure_image(docker, cfg["IMAGE_NAME"])
     cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
     start_container(docker, cfg)
     print()
@@ -503,20 +1067,22 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  python install_kali.py install --name meu-kali
-  python install_kali.py login
-  python install_kali.py install --api-key "sua-chave"
-  python install_kali.py status
+  python install_kali.py              # menu interativo
+  python install_kali.py menu
+  python install_kali.py install -i pentest-01
+  python install_kali.py list
+  python install_kali.py status -i lab-01
   python install_kali.py logs -f
-  python install_kali.py stop
         """,
     )
     parser.add_argument(
         "command",
         nargs="?",
-        default="install",
+        default=None,
         choices=[
+            "menu",
             "install",
+            "pull",
             "build",
             "start",
             "stop",
@@ -525,8 +1091,19 @@ Exemplos:
             "status",
             "logs",
             "login",
+            "list",
         ],
-        help="Ação a executar (padrão: install)",
+        help="Ação (sem argumento = menu interativo)",
+    )
+    parser.add_argument(
+        "--instance",
+        "-i",
+        help="ID da instância em instances.json",
+    )
+    parser.add_argument(
+        "--kali-profile",
+        choices=list(KALI_PROFILES.keys()),
+        help="Perfil: minimal, headless ou large",
     )
     parser.add_argument("--name", help="Nome do worker (--name do agent worker start)")
     parser.add_argument("--container-name", help="Nome do container Docker")
@@ -567,17 +1144,26 @@ def main() -> int:
         return 1
 
     command = args.command
+    if command is None:
+        if is_interactive():
+            run_interactive_menu(docker)
+            return 0
+        parser.print_help()
+        return 0
+
     non_interactive = args.non_interactive
 
-    if command == "install":
+    if command == "menu":
+        run_interactive_menu(docker)
+    elif command == "list":
+        for iid in list_instance_ids():
+            print_instance_summary(docker, iid)
+    elif command == "install":
         cmd_install(docker, cfg, non_interactive=non_interactive)
-    elif command == "build":
-        build_image(docker, cfg["IMAGE_NAME"])
+    elif command in ("pull", "build"):
+        ensure_image(docker, cfg["IMAGE_NAME"])
     elif command == "login":
-        try:
-            run(docker, ["image", "inspect", cfg["IMAGE_NAME"]], capture=True)
-        except subprocess.CalledProcessError:
-            build_image(docker, cfg["IMAGE_NAME"])
+        ensure_image(docker, cfg["IMAGE_NAME"])
         cmd_login(docker, cfg)
     elif command == "start":
         cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
