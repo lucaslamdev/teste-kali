@@ -49,7 +49,7 @@ python3 --version
 ## Passo 3 — Clonar ou copiar este repositório
 
 ```bash
-cd c:\Users\lucas\Desktop\teste-kali   # Windows
+cd /caminho/para/teste-kali            # Windows (ex.: C:\projetos\teste-kali)
 # cd ~/projetos/teste-kali             # Linux/macOS
 ```
 

@@ -182,7 +182,8 @@ def run_agent_in_container(
     if extra_env:
         for k, v in extra_env.items():
             cmd.extend(["-e", f"{k}={v}"])
-    cmd.extend([image, "bash", "-c", shell_cmd])
+    # Sobrescreve ENTRYPOINT da imagem; senão shell_cmd vira argv ignorado do entrypoint.
+    cmd.extend(["--entrypoint", "bash", image, "-c", shell_cmd])
 
     return subprocess.run(
         cmd,
@@ -263,13 +264,14 @@ def cmd_login(docker: str, cfg: dict[str, str], *, quiet_success: bool = False) 
     print("Quando aparecer o link, abra no navegador e conclua a autorização.")
     print()
 
-    result = run_agent_in_container(
-        docker,
-        cfg,
-        "export CURSOR_AUTH_MODE=login; exec /usr/local/bin/entrypoint.sh",
-        interactive=True,
-        extra_env={"CURSOR_AUTH_MODE": "login"},
-    )
+    login_script = """
+set -e
+if ! command -v agent >/dev/null 2>&1; then
+  curl -fsSL https://cursor.com/install | bash
+fi
+exec agent login
+"""
+    result = run_agent_in_container(docker, cfg, login_script, interactive=True)
     if result is None:
         raise RuntimeError("Falha ao executar login.")
     if result.returncode != 0:
@@ -342,7 +344,7 @@ def host_volume_path(path: str) -> str:
 
 def build_image(docker: str, image: str) -> None:
     print(f"[build] Construindo imagem {image}...")
-    run(docker, ["build", "-t", image, str(ROOT)])
+    run(docker, ["build", "-t", image, str(ROOT)], timeout=None)
 
 
 def start_container(docker: str, cfg: dict[str, str]) -> None:
@@ -355,9 +357,8 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         return
 
     if container_exists(docker, name):
-        print(f"[start] Reiniciando container existente '{name}'...")
-        run(docker, ["start", name])
-        return
+        print(f"[start] Recriando container '{name}' para aplicar configuração atual...")
+        run(docker, ["rm", "-f", name], check=False)
 
     auth_vol = auth_volume_name(name)
     cmd: list[str] = [
@@ -541,6 +542,7 @@ def main() -> int:
         stop_container(docker, cfg["CONTAINER_NAME"])
     elif command == "restart":
         stop_container(docker, cfg["CONTAINER_NAME"])
+        remove_container(docker, cfg["CONTAINER_NAME"])
         cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
         start_container(docker, cfg)
     elif command == "remove":

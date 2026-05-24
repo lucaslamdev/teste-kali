@@ -11,7 +11,11 @@ services:
       CURSOR_AUTH_TOKEN: ${CURSOR_AUTH_TOKEN:-}
     volumes:
       - ${WORKER_DIR:-.}:/workspace
-      - ${CONTAINER_NAME:-kali-cursor-worker}-cursor-auth:/root/.cursor
-      - ${CONTAINER_NAME:-kali-cursor-worker}-cursor-auth:/root/.config/cursor
+      - cursor-auth:/root/.cursor
+      - cursor-auth:/root/.config/cursor
     # Saída HTTPS para api2.cursor.sh e artefatos S3 (My Machines)
     # Documentação: https://cursor.com/docs/cloud-agent/my-machines
+
+volumes:
+  cursor-auth:
+    name: ${CONTAINER_NAME:-kali-cursor-worker}-cursor-auth
