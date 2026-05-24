@@ -1,0 +1,17 @@
+services:
+  kali-worker:
+    build: .
+    image: ${IMAGE_NAME:-kali-cursor-worker:latest}
+    container_name: ${CONTAINER_NAME:-kali-cursor-worker}
+    restart: unless-stopped
+    environment:
+      WORKER_NAME: ${WORKER_NAME:-kali-docker-worker}
+      CURSOR_WORKER_DIR: ${CURSOR_WORKER_DIR:-/workspace}
+      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      CURSOR_AUTH_TOKEN: ${CURSOR_AUTH_TOKEN:-}
+    volumes:
+      - ${WORKER_DIR:-.}:/workspace
+      - ${CONTAINER_NAME:-kali-cursor-worker}-cursor-auth:/root/.cursor
+      - ${CONTAINER_NAME:-kali-cursor-worker}-cursor-auth:/root/.config/cursor
+    # Saída HTTPS para api2.cursor.sh e artefatos S3 (My Machines)
+    # Documentação: https://cursor.com/docs/cloud-agent/my-machines
