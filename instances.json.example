@@ -1,0 +1,29 @@
+{
+  "active": "default",
+  "instances": {
+    "default": {
+      "id": "default",
+      "container_name": "kali-cursor-worker",
+      "worker_name": "kali-docker-worker",
+      "worker_dir": ".",
+      "image_name": "kalilinux/kali-rolling:latest",
+      "kali_profile": "minimal",
+      "cursor_api_key": "",
+      "cursor_auth_token": "",
+      "cursor_worker_dir": "/workspace",
+      "auth_mode": "api_key"
+    },
+    "pentest-01": {
+      "id": "pentest-01",
+      "container_name": "kali-pentest-01",
+      "worker_name": "pentest-01",
+      "worker_dir": "C:/projetos/meu-repo",
+      "image_name": "kalilinux/kali-rolling:latest",
+      "kali_profile": "headless",
+      "cursor_api_key": "",
+      "cursor_auth_token": "",
+      "cursor_worker_dir": "/workspace",
+      "auth_mode": "login"
+    }
+  }
+}

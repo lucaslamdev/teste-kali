@@ -123,9 +123,9 @@ O script irá:
 1. Detectar o sistema operacional do host
 2. Localizar o executável `docker`
 3. Verificar se o daemon está ativo
-4. Construir a imagem `kali-cursor-worker:latest`
-5. Criar e iniciar o container
-6. No container: instalar `agent` (se necessário) e executar `agent worker start --name <WORKER_NAME>`
+4. Baixar a imagem oficial `kalilinux/kali-rolling:latest` ([Docker Hub](https://hub.docker.com/r/kalilinux/kali-rolling))
+5. Criar e iniciar o container (entrypoint montado do host)
+6. No container: instalar dependências/`agent` (se necessário) e executar `agent worker start --name <WORKER_NAME>`
 
 **Com nome customizado via CLI:**
 
@@ -180,9 +180,9 @@ python install_kali.py restart
 # Remover container (imagem permanece)
 python install_kali.py remove
 
-# Rebuild após mudanças no Dockerfile
-python install_kali.py build
-python install_kali.py start
+# Atualizar imagem oficial e reiniciar
+python install_kali.py pull
+python install_kali.py restart
 ```
 
 ---
@@ -190,25 +190,31 @@ python install_kali.py start
 ## Instalação manual (sem Python)
 
 ```bash
-docker build -t kali-cursor-worker:latest .
+docker pull kalilinux/kali-rolling:latest
 docker run -d \
   --name kali-cursor-worker \
   -v "$(pwd):/workspace" \
+  -v "$(pwd)/scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" \
+  -w /workspace \
+  --entrypoint /usr/local/bin/entrypoint.sh \
   -e WORKER_NAME=meu-kali \
   -e CURSOR_API_KEY=sua_chave \
-  kali-cursor-worker:latest
+  kalilinux/kali-rolling:latest
 ```
 
 Windows (PowerShell):
 
 ```powershell
-docker build -t kali-cursor-worker:latest .
+docker pull kalilinux/kali-rolling:latest
 docker run -d `
   --name kali-cursor-worker `
   -v "${PWD}:/workspace" `
+  -v "${PWD}/scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" `
+  -w /workspace `
+  --entrypoint /usr/local/bin/entrypoint.sh `
   -e WORKER_NAME=meu-kali `
   -e CURSOR_API_KEY=sua_chave `
-  kali-cursor-worker:latest
+  kalilinux/kali-rolling:latest
 ```
 
 ---
@@ -263,6 +269,6 @@ docker exec -it kali-cursor-worker agent worker start --debug --name meu-kali
 
 ## Próximos passos
 
-- Ajuste `Dockerfile` para pré-instalar `kali-linux-headless`
+- Para metapacote completo: `apt install -y kali-linux-headless` dentro do container
 - Use labels e pools com `--pool` para ambientes Enterprise ([Self-Hosted Pool](https://cursor.com/docs/cloud-agent/self-hosted-pool))
 - Automatize em CI com `CURSOR_API_KEY` em secrets

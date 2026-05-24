@@ -1,9 +1,9 @@
 services:
   kali-worker:
-    build: .
-    image: ${IMAGE_NAME:-kali-cursor-worker:latest}
+    image: ${IMAGE_NAME:-kalilinux/kali-rolling:latest}
     container_name: ${CONTAINER_NAME:-kali-cursor-worker}
     restart: unless-stopped
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
     environment:
       WORKER_NAME: ${WORKER_NAME:-kali-docker-worker}
       CURSOR_WORKER_DIR: ${CURSOR_WORKER_DIR:-/workspace}
@@ -11,6 +11,7 @@ services:
       CURSOR_AUTH_TOKEN: ${CURSOR_AUTH_TOKEN:-}
     volumes:
       - ${WORKER_DIR:-.}:/workspace
+      - ./scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
       - cursor-auth:/root/.cursor
       - cursor-auth:/root/.config/cursor
     # Saída HTTPS para api2.cursor.sh e artefatos S3 (My Machines)
