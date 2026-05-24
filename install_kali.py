@@ -75,11 +75,6 @@ def cursor_auth_env_file_args(cfg: dict[str, str]) -> tuple[list[str], Path | No
     if not pairs:
         return [], None
 
-    if ENV_FILE.is_file():
-        on_disk = load_dotenv(ENV_FILE)
-        if all(on_disk.get(key) == value for key, value in pairs):
-            return ["--env-file", str(ENV_FILE)], None
-
     fd, path_str = tempfile.mkstemp(prefix="cursor-docker-env-", suffix=".env")
     os.close(fd)
     path = Path(path_str)
@@ -237,10 +232,11 @@ def is_agent_authenticated(docker: str, cfg: dict[str, str]) -> bool:
 
     script = """
 set -e
-if ! command -v agent >/dev/null 2>&1; then
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
-agent status
+"$AGENT_BIN" status
 """
     result = run_agent_in_container(docker, cfg, script, interactive=False)
     if result is None:
@@ -303,10 +299,11 @@ def cmd_login(docker: str, cfg: dict[str, str], *, quiet_success: bool = False) 
 
     login_script = """
 set -e
-if ! command -v agent >/dev/null 2>&1; then
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
-exec agent login
+exec "$AGENT_BIN" login
 """
     result = run_agent_in_container(docker, cfg, login_script, interactive=True)
     if result is None:
