@@ -149,8 +149,12 @@ def container_running(docker: str, name: str) -> bool:
     return name in (result.stdout or "").strip().splitlines()
 
 
-def auth_volume_name(container_name: str) -> str:
-    return f"{container_name}-cursor-auth"
+def auth_home_volume_name(container_name: str) -> str:
+    return f"{container_name}-cursor-auth-home"
+
+
+def auth_config_volume_name(container_name: str) -> str:
+    return f"{container_name}-cursor-auth-config"
 
 
 def is_interactive() -> bool:
@@ -189,7 +193,8 @@ def run_agent_in_container(
 ) -> subprocess.CompletedProcess[str] | None:
     """Executa comando no contexto da imagem (com volume de auth)."""
     image = cfg["IMAGE_NAME"]
-    auth_vol = auth_volume_name(cfg["CONTAINER_NAME"])
+    auth_home = auth_home_volume_name(cfg["CONTAINER_NAME"])
+    auth_config = auth_config_volume_name(cfg["CONTAINER_NAME"])
     worker_mount = host_volume_path(cfg["WORKER_DIR"])
 
     cmd: list[str] = [
@@ -199,9 +204,9 @@ def run_agent_in_container(
         "-v",
         f"{worker_mount}:/workspace",
         "-v",
-        f"{auth_vol}:/root/.cursor",
+        f"{auth_home}:/root/.cursor",
         "-v",
-        f"{auth_vol}:/root/.config/cursor",
+        f"{auth_config}:/root/.config/cursor",
     ]
     if interactive:
         cmd.insert(2, "-it")
@@ -313,8 +318,9 @@ exec "$AGENT_BIN" login
         raise SystemExit(result.returncode)
 
     print()
-    print("[ok] Login concluído. Credenciais salvas no volume Docker:")
-    print(f"     {auth_volume_name(cfg['CONTAINER_NAME'])}")
+    print("[ok] Login concluído. Credenciais salvas nos volumes Docker:")
+    print(f"     {auth_home_volume_name(cfg['CONTAINER_NAME'])}")
+    print(f"     {auth_config_volume_name(cfg['CONTAINER_NAME'])}")
     if not quiet_success:
         print()
         print("Agora execute: python install_kali.py install")
@@ -394,7 +400,8 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         print(f"[start] Recriando container '{name}' para aplicar configuração atual...")
         run(docker, ["rm", "-f", name], check=False)
 
-    auth_vol = auth_volume_name(name)
+    auth_home = auth_home_volume_name(name)
+    auth_config = auth_config_volume_name(name)
     env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
     cmd: list[str] = [
         "run",
@@ -406,9 +413,9 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         "-v",
         f"{worker_mount}:/workspace",
         "-v",
-        f"{auth_vol}:/root/.cursor",
+        f"{auth_home}:/root/.cursor",
         "-v",
-        f"{auth_vol}:/root/.config/cursor",
+        f"{auth_config}:/root/.config/cursor",
         "-e",
         f"WORKER_NAME={cfg['WORKER_NAME']}",
         "-e",
@@ -456,7 +463,6 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     print(f"Imagem       : {cfg['IMAGE_NAME']}")
     print(f"Worker name  : {cfg['WORKER_NAME']}")
     print(f"Volume host  : {cfg['WORKER_DIR']} -> /workspace")
-    auth_vol = auth_volume_name(name)
     if cfg.get("CURSOR_API_KEY"):
         auth_label = "API key (.env/CLI)"
     elif cfg.get("CURSOR_AUTH_TOKEN"):
@@ -464,7 +470,7 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     else:
         auth_label = "agent login (volume)" if is_agent_authenticated(docker, cfg) else "(não autenticado)"
     print(f"Autenticação : {auth_label}")
-    print(f"Volume auth  : {auth_vol}")
+    print(f"Volume auth  : {auth_home_volume_name(name)}, {auth_config_volume_name(name)}")
     print()
     if container_running(docker, name):
         print(f"Status: EM EXECUÇÃO")
