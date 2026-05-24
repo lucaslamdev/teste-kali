@@ -32,4 +32,4 @@ This is a Python + Bash utility that provisions **Kali Linux Docker containers**
 
 ### Docker setup in Cloud Agent VM
 
-Docker must be installed and configured with `fuse-overlayfs` storage driver and `iptables-legacy` before the daemon starts. The daemon must be started manually with `sudo dockerd` and the Docker socket needs `chmod 666 /var/run/docker.sock` for non-root access.
+Docker must be installed and configured with `fuse-overlayfs` storage driver and `iptables-legacy` before the daemon starts. The daemon must be started manually with `sudo dockerd`. For non-root access, add the user to the `docker` group (`sudo usermod -aG docker $USER`; log out and back in for the change to take effect).
