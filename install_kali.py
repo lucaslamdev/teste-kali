@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -529,7 +530,7 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
         "WORKER_NAME": pick("WORKER_NAME", args.name, DEFAULT_WORKER_NAME),
         "CONTAINER_NAME": pick("CONTAINER_NAME", args.container_name, DEFAULT_CONTAINER),
         "IMAGE_NAME": pick("IMAGE_NAME", args.image, DEFAULT_IMAGE),
-        "WORKER_DIR": str(Path(worker_dir).expanduser().resolve()),
+        "WORKER_DIR": str(resolve_path_from_root(worker_dir)),
         "CURSOR_API_KEY": pick("CURSOR_API_KEY", args.api_key, ""),
         "CURSOR_AUTH_TOKEN": pick("CURSOR_AUTH_TOKEN", args.auth_token, ""),
         "CURSOR_WORKER_DIR": pick("CURSOR_WORKER_DIR", args.worker_dir_in_container, "/workspace"),
@@ -537,6 +538,33 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
         "KALI_METAPACKAGE": meta,
         "_instance_id": "",
     }
+
+
+
+def resolve_path_from_root(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def cursor_auth_env_file_args(cfg: dict[str, str]) -> tuple[list[str], Path | None]:
+    """Pass auth vars via --env-file so secrets are not visible in docker CLI argv."""
+    pairs: list[tuple[str, str]] = []
+    if cfg.get("CURSOR_API_KEY"):
+        pairs.append(("CURSOR_API_KEY", cfg["CURSOR_API_KEY"]))
+    if cfg.get("CURSOR_AUTH_TOKEN"):
+        pairs.append(("CURSOR_AUTH_TOKEN", cfg["CURSOR_AUTH_TOKEN"]))
+    if not pairs:
+        return [], None
+
+    fd, path_str = tempfile.mkstemp(prefix="cursor-docker-env-", suffix=".env")
+    os.close(fd)
+    path = Path(path_str)
+    path.write_text("\n".join(f"{key}={value}" for key, value in pairs) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return ["--env-file", str(path)], path
+
 
 
 def find_docker() -> str:
@@ -604,8 +632,16 @@ def container_running(docker: str, name: str) -> bool:
     return name in (result.stdout or "").strip().splitlines()
 
 
+def auth_home_volume_name(container_name: str) -> str:
+    return f"{container_name}-cursor-auth-home"
+
+
+def auth_config_volume_name(container_name: str) -> str:
+    return f"{container_name}-cursor-auth-config"
+
+
 def auth_volume_name(container_name: str) -> str:
-    return f"{container_name}-cursor-auth"
+    return auth_home_volume_name(container_name)
 
 
 def is_interactive() -> bool:
@@ -644,7 +680,8 @@ def run_agent_in_container(
 ) -> subprocess.CompletedProcess[str] | None:
     """Executa comando no contexto da imagem (com volume de auth)."""
     image = cfg["IMAGE_NAME"]
-    auth_vol = auth_volume_name(cfg["CONTAINER_NAME"])
+    auth_home = auth_home_volume_name(cfg["CONTAINER_NAME"])
+    auth_config = auth_config_volume_name(cfg["CONTAINER_NAME"])
     worker_mount = host_volume_path(cfg["WORKER_DIR"])
 
     cmd: list[str] = [
@@ -654,41 +691,47 @@ def run_agent_in_container(
         "-v",
         f"{worker_mount}:/workspace",
         "-v",
-        f"{auth_vol}:/root/.cursor",
+        f"{auth_home}:/root/.cursor",
         "-v",
-        f"{auth_vol}:/root/.config/cursor",
+        f"{auth_config}:/root/.config/cursor",
     ]
     if interactive:
         cmd.insert(2, "-it")
-    if cfg.get("CURSOR_API_KEY"):
-        cmd.extend(["-e", f"CURSOR_API_KEY={cfg['CURSOR_API_KEY']}"])
+    env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
+    cmd.extend(env_file_args)
     if extra_env:
         for k, v in extra_env.items():
             cmd.extend(["-e", f"{k}={v}"])
     # Sobrescreve ENTRYPOINT da imagem; senão shell_cmd vira argv ignorado do entrypoint.
     cmd.extend(["--entrypoint", "bash", image, "-c", shell_cmd])
 
-    return subprocess.run(
-        cmd,
-        cwd=ROOT,
-        check=False,
-        text=True,
-        timeout=None if interactive else 120,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            timeout=None if interactive else 120,
+        )
+    finally:
+        if env_file_cleanup is not None:
+            env_file_cleanup.unlink(missing_ok=True)
 
 
 def is_agent_authenticated(docker: str, cfg: dict[str, str]) -> bool:
     if has_credentials(cfg):
         return True
 
-    script = f"""
-set -e
-{apt_bootstrap_snippet()}
-if ! command -v agent >/dev/null 2>&1; then
+    script = (
+        apt_bootstrap_snippet()
+        + """
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
-agent status
+"$AGENT_BIN" status
 """
+    )
     result = run_agent_in_container(docker, cfg, script, interactive=False)
     if result is None:
         return False
@@ -748,14 +791,16 @@ def cmd_login(docker: str, cfg: dict[str, str], *, quiet_success: bool = False) 
     print("Quando aparecer o link, abra no navegador e conclua a autorização.")
     print()
 
-    login_script = f"""
-set -e
-{apt_bootstrap_snippet()}
-if ! command -v agent >/dev/null 2>&1; then
+    login_script = (
+        apt_bootstrap_snippet()
+        + """
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
   curl -fsSL https://cursor.com/install | bash
 fi
-exec agent login
+exec "$AGENT_BIN" login
 """
+    )
     result = run_agent_in_container(docker, cfg, login_script, interactive=True)
     if result is None:
         raise RuntimeError("Falha ao executar login.")
@@ -764,8 +809,9 @@ exec agent login
         raise SystemExit(result.returncode)
 
     print()
-    print("[ok] Login concluído. Credenciais salvas no volume Docker:")
-    print(f"     {auth_volume_name(cfg['CONTAINER_NAME'])}")
+    print("[ok] Login concluído. Credenciais salvas nos volumes Docker:")
+    print(f"     {auth_home_volume_name(cfg['CONTAINER_NAME'])}")
+    print(f"     {auth_config_volume_name(cfg['CONTAINER_NAME'])}")
     if not quiet_success:
         print()
         print("Agora execute: python install_kali.py install")
@@ -860,27 +906,28 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         print(f"[start] Recriando container '{name}' para aplicar configuração atual...")
         run(docker, ["rm", "-f", name], check=False)
 
-    auth_vol = auth_volume_name(name)
+    auth_home = auth_home_volume_name(name)
+    auth_config = auth_config_volume_name(name)
+    env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
     cmd: list[str] = [
         "run",
         "-d",
+        "--restart",
+        "unless-stopped",
         "--name",
         name,
         "-v",
         f"{worker_mount}:/workspace",
         "-v",
-        f"{auth_vol}:/root/.cursor",
+        f"{auth_home}:/root/.cursor",
         "-v",
-        f"{auth_vol}:/root/.config/cursor",
+        f"{auth_config}:/root/.config/cursor",
         "-e",
         f"WORKER_NAME={cfg['WORKER_NAME']}",
         "-e",
         f"CURSOR_WORKER_DIR={cfg['CURSOR_WORKER_DIR']}",
     ]
-    if cfg.get("CURSOR_API_KEY"):
-        cmd.extend(["-e", f"CURSOR_API_KEY={cfg['CURSOR_API_KEY']}"])
-    if cfg.get("CURSOR_AUTH_TOKEN"):
-        cmd.extend(["-e", f"CURSOR_AUTH_TOKEN={cfg['CURSOR_AUTH_TOKEN']}"])
+    cmd.extend(env_file_args)
     if cfg.get("KALI_METAPACKAGE"):
         cmd.extend(["-e", f"KALI_METAPACKAGE={cfg['KALI_METAPACKAGE']}"])
     if uses_official_image(image):
@@ -902,7 +949,11 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
     print(f"[run] Subindo container '{name}' (worker: {cfg['WORKER_NAME']})...")
     if uses_official_image(image):
         print(f"       Imagem: {image} (oficial Kali)")
-    run(docker, cmd)
+    try:
+        run(docker, cmd)
+    finally:
+        if env_file_cleanup is not None:
+            env_file_cleanup.unlink(missing_ok=True)
 
 
 def stop_container(docker: str, name: str) -> None:
@@ -910,7 +961,7 @@ def stop_container(docker: str, name: str) -> None:
         print(f"[info] Container '{name}' não existe.")
         return
     print(f"[stop] Parando '{name}'...")
-    run(docker, ["stop", name], check=False)
+    run(docker, ["stop", name], check=False, timeout=60)
 
 
 def remove_container(docker: str, name: str) -> None:
@@ -940,7 +991,6 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     print(f"Volume host  : {cfg['WORKER_DIR']} -> /workspace")
     if cfg.get("_instance_id"):
         print(f"Instância    : {cfg['_instance_id']}")
-    auth_vol = auth_volume_name(name)
     if cfg.get("CURSOR_API_KEY"):
         auth_label = "API key (.env/CLI)"
     elif cfg.get("CURSOR_AUTH_TOKEN"):
@@ -948,7 +998,7 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     else:
         auth_label = "agent login (volume)" if is_agent_authenticated(docker, cfg) else "(não autenticado)"
     print(f"Autenticação : {auth_label}")
-    print(f"Volume auth  : {auth_vol}")
+    print(f"Volume auth  : {auth_home_volume_name(name)}, {auth_config_volume_name(name)}")
     print()
     if container_running(docker, name):
         print(f"Status: EM EXECUÇÃO")

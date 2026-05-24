@@ -87,12 +87,6 @@ build_worker_cmd() {
   bin="$(agent_bin)"
   local cmd=("$bin" worker start --name "$WORKER_NAME" --worker-dir "$WORKER_DIR")
 
-  if [[ -n "${CURSOR_API_KEY:-}" ]]; then
-    cmd+=(--api-key "$CURSOR_API_KEY")
-  elif [[ -n "${CURSOR_AUTH_TOKEN:-}" ]]; then
-    cmd+=(--auth-token "$CURSOR_AUTH_TOKEN")
-  fi
-
   printf '%s\n' "${cmd[@]}"
 }
 
