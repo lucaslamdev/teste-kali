@@ -657,33 +657,24 @@ def auth_volume_name(container_name: str) -> str:
 
 
 def login_auth_volumes_populated(docker: str, container_name: str) -> bool:
-    """Verifica se volumes de login têm conteúdo (sem subir container Kali)."""
+    """Verifica se volumes de login têm conteúdo (sem subir container)."""
     for vol in (auth_home_volume_name(container_name), auth_config_volume_name(container_name)):
-        exists = run(
+        result = run(
             docker,
-            ["volume", "inspect", vol],
+            ["volume", "inspect", "-f", "{{.Mountpoint}}", vol],
             capture=True,
             check=False,
         )
-        if exists.returncode != 0:
+        if result.returncode != 0:
             continue
-        check = run(
-            docker,
-            [
-                "run",
-                "--rm",
-                "-v",
-                f"{vol}:/check:ro",
-                "alpine",
-                "sh",
-                "-c",
-                "ls -A /check 2>/dev/null | head -1",
-            ],
-            capture=True,
-            check=False,
-        )
-        if check.returncode == 0 and (check.stdout or "").strip():
-            return True
+        mount = Path((result.stdout or "").strip())
+        if not mount.is_dir():
+            continue
+        try:
+            if any(mount.iterdir()):
+                return True
+        except OSError:
+            continue
     return False
 
 
@@ -766,7 +757,8 @@ def is_agent_authenticated(docker: str, cfg: dict[str, str]) -> bool:
         return True
 
     script = (
-        apt_bootstrap_snippet()
+        "set -e\n"
+        + apt_bootstrap_snippet()
         + """
 AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
 if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
@@ -835,7 +827,8 @@ def cmd_login(docker: str, cfg: dict[str, str], *, quiet_success: bool = False) 
     print()
 
     login_script = (
-        apt_bootstrap_snippet()
+        "set -e\n"
+        + apt_bootstrap_snippet()
         + """
 AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
 if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
