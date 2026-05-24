@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -49,11 +50,43 @@ def merge_config(args: argparse.Namespace) -> dict[str, str]:
         "WORKER_NAME": pick("WORKER_NAME", args.name, DEFAULT_WORKER_NAME),
         "CONTAINER_NAME": pick("CONTAINER_NAME", args.container_name, DEFAULT_CONTAINER),
         "IMAGE_NAME": pick("IMAGE_NAME", args.image, DEFAULT_IMAGE),
-        "WORKER_DIR": str(Path(worker_dir).expanduser().resolve()),
+        "WORKER_DIR": str(resolve_path_from_root(worker_dir)),
         "CURSOR_API_KEY": pick("CURSOR_API_KEY", args.api_key, ""),
         "CURSOR_AUTH_TOKEN": pick("CURSOR_AUTH_TOKEN", args.auth_token, ""),
         "CURSOR_WORKER_DIR": pick("CURSOR_WORKER_DIR", args.worker_dir_in_container, "/workspace"),
     }
+
+
+
+def resolve_path_from_root(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def cursor_auth_env_file_args(cfg: dict[str, str]) -> tuple[list[str], Path | None]:
+    """Pass auth vars via --env-file so secrets are not visible in docker CLI argv."""
+    pairs: list[tuple[str, str]] = []
+    if cfg.get("CURSOR_API_KEY"):
+        pairs.append(("CURSOR_API_KEY", cfg["CURSOR_API_KEY"]))
+    if cfg.get("CURSOR_AUTH_TOKEN"):
+        pairs.append(("CURSOR_AUTH_TOKEN", cfg["CURSOR_AUTH_TOKEN"]))
+    if not pairs:
+        return [], None
+
+    if ENV_FILE.is_file():
+        on_disk = load_dotenv(ENV_FILE)
+        if all(on_disk.get(key) == value for key, value in pairs):
+            return ["--env-file", str(ENV_FILE)], None
+
+    fd, path_str = tempfile.mkstemp(prefix="cursor-docker-env-", suffix=".env")
+    os.close(fd)
+    path = Path(path_str)
+    path.write_text("\n".join(f"{key}={value}" for key, value in pairs) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return ["--env-file", str(path)], path
+
 
 
 def find_docker() -> str:
@@ -177,21 +210,25 @@ def run_agent_in_container(
     ]
     if interactive:
         cmd.insert(2, "-it")
-    if cfg.get("CURSOR_API_KEY"):
-        cmd.extend(["-e", f"CURSOR_API_KEY={cfg['CURSOR_API_KEY']}"])
+    env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
+    cmd.extend(env_file_args)
     if extra_env:
         for k, v in extra_env.items():
             cmd.extend(["-e", f"{k}={v}"])
     # Sobrescreve ENTRYPOINT da imagem; senão shell_cmd vira argv ignorado do entrypoint.
     cmd.extend(["--entrypoint", "bash", image, "-c", shell_cmd])
 
-    return subprocess.run(
-        cmd,
-        cwd=ROOT,
-        check=False,
-        text=True,
-        timeout=None if interactive else 120,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            timeout=None if interactive else 120,
+        )
+    finally:
+        if env_file_cleanup is not None:
+            env_file_cleanup.unlink(missing_ok=True)
 
 
 def is_agent_authenticated(docker: str, cfg: dict[str, str]) -> bool:
@@ -361,9 +398,12 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         run(docker, ["rm", "-f", name], check=False)
 
     auth_vol = auth_volume_name(name)
+    env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
     cmd: list[str] = [
         "run",
         "-d",
+        "--restart",
+        "unless-stopped",
         "--name",
         name,
         "-v",
@@ -377,14 +417,15 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         "-e",
         f"CURSOR_WORKER_DIR={cfg['CURSOR_WORKER_DIR']}",
     ]
-    if cfg.get("CURSOR_API_KEY"):
-        cmd.extend(["-e", f"CURSOR_API_KEY={cfg['CURSOR_API_KEY']}"])
-    if cfg.get("CURSOR_AUTH_TOKEN"):
-        cmd.extend(["-e", f"CURSOR_AUTH_TOKEN={cfg['CURSOR_AUTH_TOKEN']}"])
+    cmd.extend(env_file_args)
     cmd.append(image)
 
     print(f"[run] Subindo container '{name}' (worker: {cfg['WORKER_NAME']})...")
-    run(docker, cmd)
+    try:
+        run(docker, cmd)
+    finally:
+        if env_file_cleanup is not None:
+            env_file_cleanup.unlink(missing_ok=True)
 
 
 def stop_container(docker: str, name: str) -> None:
@@ -392,7 +433,7 @@ def stop_container(docker: str, name: str) -> None:
         print(f"[info] Container '{name}' não existe.")
         return
     print(f"[stop] Parando '{name}'...")
-    run(docker, ["stop", name], check=False)
+    run(docker, ["stop", name], check=False, timeout=60)
 
 
 def remove_container(docker: str, name: str) -> None:
