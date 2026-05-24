@@ -11,7 +11,8 @@
       "cursor_api_key": "",
       "cursor_auth_token": "",
       "cursor_worker_dir": "/workspace",
-      "auth_mode": "api_key"
+      "auth_mode": "api_key",
+      "_comment_auth": "auth_mode: api_key | login — troca com: python install_kali.py auth -i default"
     },
     "pentest-01": {
       "id": "pentest-01",

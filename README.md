@@ -107,20 +107,28 @@ python install_kali.py install --api-key "$env:CURSOR_API_KEY"
 | `build` | Alias de `pull` (imagem oficial) |
 | `start` | Inicia container existente ou cria um novo |
 | `stop` | Para o container |
-| `restart` | Para e inicia novamente |
+| `restart` | `docker restart` (auth dinâmica) ou recria se container antigo |
 | `remove` | Remove o container |
 | `status` | Exibe configuração e estado |
 | `logs` | Mostra logs (`-f` para seguir) |
 | `login` | `agent login` interativo (link no navegador) |
+| `auth` | Troca API key ↔ login sem `docker rm` (menu ou flags) |
 
 ## Docker Compose (alternativa)
 
 ```bash
 cp .env.example .env
+mkdir -p .cursor-auth
+# Arquivo montado no container (preencha CURSOR_API_KEY no .env e copie para o auth file se usar compose)
+echo "CURSOR_API_KEY=" > .cursor-auth/kali-cursor-worker.env
 docker compose pull
 docker compose up -d
 docker compose logs -f
 ```
+
+## Solução de problemas
+
+Se o container **reiniciar em loop**, veja `python install_kali.py logs`. Erro `liveness endpoint returned 404` indica API key inválida — atualize com `python install_kali.py auth --api-key "..." -i default`. Após a correção do entrypoint, o container permanece ativo para diagnóstico em vez de reiniciar indefinidamente.
 
 ## Autenticação do worker
 
@@ -131,7 +139,8 @@ O worker exige autenticação. O script oferece duas formas:
 | **API key** | `CURSOR_API_KEY` no `.env`, `--api-key`, ou opção `[1]` no prompt do `install` |
 | **agent login** | `python install_kali.py login` ou opção `[2]` no `install` (abre link no navegador) |
 
-Credenciais do login ficam no volume Docker `{CONTAINER_NAME}-cursor-auth`.
+Credenciais do login ficam nos volumes `{CONTAINER_NAME}-cursor-auth-home` e `-cursor-auth-config`.
+API keys ficam em `instances.json` (por instância) e em `.cursor-auth/<container>.env` no host — montado em `/run/cursor/auth.env` dentro do container. Trocar a key atualiza o arquivo e faz `docker restart` (sem recriar o container por padrão).
 
 ```bash
 # Só login (sem subir worker ainda)
@@ -139,6 +148,12 @@ python install_kali.py login
 
 # CI / automação (sem prompts)
 python install_kali.py install --non-interactive --api-key "$CURSOR_API_KEY"
+
+# Trocar API key na instância em execução
+python install_kali.py auth --api-key "$CURSOR_API_KEY" -i default
+
+# Menu: Gerenciar instância → [7] Alterar autenticação
+python install_kali.py auth -i pentest-01
 ```
 
 ## Estrutura do projeto

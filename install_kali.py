@@ -26,6 +26,8 @@ DEFAULT_WORKER_NAME = "kali-docker-worker"
 ENTRYPOINT_SCRIPT = ROOT / "scripts" / "entrypoint.sh"
 ENV_FILE = ROOT / ".env"
 INSTANCES_FILE = ROOT / "instances.json"
+AUTH_DIR = ROOT / ".cursor-auth"
+RUNTIME_AUTH_CONTAINER_PATH = "/run/cursor/auth.env"
 
 KALI_PROFILES: dict[str, tuple[str, str]] = {
     "minimal": ("Mínimo (curl, git + Cursor agent)", ""),
@@ -68,6 +70,7 @@ def cfg_from_instance(inst: dict) -> dict[str, str]:
         "CURSOR_WORKER_DIR": inst.get("cursor_worker_dir", "/workspace"),
         "KALI_PROFILE": profile,
         "KALI_METAPACKAGE": meta,
+        "auth_mode": inst.get("auth_mode", "api_key" if inst.get("cursor_api_key") else "login"),
         "_instance_id": inst.get("id", ""),
     }
 
@@ -181,9 +184,15 @@ def print_instance_summary(docker: str, instance_id: str) -> None:
     cfg = get_instance_cfg(instance_id)
     rt = instance_runtime_status(docker, cfg)
     profile_label = KALI_PROFILES.get(cfg["KALI_PROFILE"], ("?", ""))[0]
-    auth = "API key" if cfg.get("CURSOR_API_KEY") else (
-        "login (volume)" if login_auth_volumes_populated(docker, cfg["CONTAINER_NAME"]) else "não configurado"
-    )
+    mode = cfg.get("auth_mode") or ("api_key" if cfg.get("CURSOR_API_KEY") else "login")
+    if mode == "api_key" and cfg.get("CURSOR_API_KEY"):
+        auth = "API key"
+    elif mode == "login" and login_auth_volumes_populated(docker, cfg["CONTAINER_NAME"]):
+        auth = "login (volume)"
+    elif mode == "login":
+        auth = "login (pendente)"
+    else:
+        auth = "não configurado"
     state = "EM EXECUÇÃO" if rt["running"] else ("PARADO" if rt["exists"] else "NÃO CRIADO")
     print(f"  [{instance_id}] {cfg['CONTAINER_NAME']} | worker={cfg['WORKER_NAME']}")
     print(f"           perfil={profile_label} | auth={auth} | {state}")
@@ -295,10 +304,9 @@ def flow_manage_instance(docker: str, instance_id: str) -> None:
         print("  [4] Reiniciar (restart)")
         print("  [5] Status detalhado")
         print("  [6] Logs")
-        print("  [7] Autenticação — API key")
-        print("  [8] Autenticação — agent login")
-        print("  [9] Trocar perfil Kali (minimal/headless/large)")
-        print("  [10] Remover container e registro da instância")
+        print("  [7] Alterar autenticação (API key ↔ login, sem recriar container)")
+        print("  [8] Trocar perfil Kali (minimal/headless/large)")
+        print("  [9] Remover container e registro da instância")
         print("  [0] Voltar")
         choice = input("\nEscolha: ").strip()
 
@@ -312,54 +320,32 @@ def flow_manage_instance(docker: str, instance_id: str) -> None:
         elif choice == "3":
             stop_container(docker, cfg["CONTAINER_NAME"])
         elif choice == "4":
-            stop_container(docker, cfg["CONTAINER_NAME"])
-            remove_container(docker, cfg["CONTAINER_NAME"])
-            cfg = ensure_authentication(docker, cfg, non_interactive=False)
-            start_container(docker, cfg)
+            write_runtime_auth_file(cfg)
+            if container_exists(docker, cfg["CONTAINER_NAME"]) and container_has_auth_mount(
+                docker, cfg["CONTAINER_NAME"]
+            ):
+                restart_worker_light(docker, cfg)
+            else:
+                stop_container(docker, cfg["CONTAINER_NAME"])
+                remove_container(docker, cfg["CONTAINER_NAME"])
+                cfg = ensure_authentication(docker, cfg, non_interactive=False)
+                start_container(docker, cfg)
         elif choice == "5":
             show_status(docker, cfg)
         elif choice == "6":
             follow = input("Seguir logs em tempo real? [s/N]: ").strip().lower() in ("s", "sim", "y", "yes")
             show_logs(docker, cfg["CONTAINER_NAME"], follow)
         elif choice == "7":
-            try:
-                key = prompt_api_key()
-            except ValueError as exc:
-                print(f"Erro: {exc}")
-                continue
-            data = load_instances()
-            rec = data["instances"][instance_id]
-            rec["cursor_api_key"] = key
-            rec["auth_mode"] = "api_key"
-            save_instance_record(instance_id, rec)
+            flow_change_auth(docker, instance_id)
             cfg = get_instance_cfg(instance_id)
-            ans = input("Recriar container agora? [S/n]: ").strip().lower()
-            if ans in ("", "s", "sim", "y", "yes"):
-                stop_container(docker, cfg["CONTAINER_NAME"])
-                remove_container(docker, cfg["CONTAINER_NAME"])
-                start_container(docker, cfg)
         elif choice == "8":
-            ensure_image(docker, cfg["IMAGE_NAME"])
-            cmd_login(docker, cfg)
-            ans = input("Recriar container com login salvo? [S/n]: ").strip().lower()
-            if ans in ("", "s", "sim", "y", "yes"):
-                data = load_instances()
-                rec = data["instances"][instance_id]
-                rec["auth_mode"] = "login"
-                rec["cursor_api_key"] = ""
-                save_instance_record(instance_id, rec)
-                cfg = get_instance_cfg(instance_id)
-                stop_container(docker, cfg["CONTAINER_NAME"])
-                remove_container(docker, cfg["CONTAINER_NAME"])
-                start_container(docker, cfg)
-        elif choice == "9":
             profile = prompt_kali_profile()
             data = load_instances()
             rec = data["instances"][instance_id]
             rec["kali_profile"] = profile
             save_instance_record(instance_id, rec)
             print("[info] Perfil alterado. Recrie o container (opção 1 ou 4).")
-        elif choice == "10":
+        elif choice == "9":
             cfg = get_instance_cfg(instance_id)
             stop_container(docker, cfg["CONTAINER_NAME"])
             remove_container(docker, cfg["CONTAINER_NAME"])
@@ -597,6 +583,9 @@ def find_docker() -> str:
 
 
 DOCKER_TIMEOUT_SEC = 15
+DOCKER_RM_TIMEOUT_SEC = 120
+# Evita loop infinito se o entrypoint sair com erro (worker/auth).
+DOCKER_RESTART_POLICY = "on-failure:2"
 
 
 def run(
@@ -676,6 +665,228 @@ def login_auth_volumes_populated(docker: str, container_name: str) -> bool:
         except OSError:
             continue
     return False
+
+
+def runtime_auth_file_host(cfg: dict[str, str]) -> Path:
+    return AUTH_DIR / f"{cfg['CONTAINER_NAME']}.env"
+
+
+def write_runtime_auth_file(cfg: dict[str, str]) -> Path:
+    """Grava credenciais no host; o container monta em /run/cursor/auth.env."""
+    path = runtime_auth_file_host(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    mode = cfg.get("auth_mode") or ("api_key" if cfg.get("CURSOR_API_KEY") else "login")
+    if mode == "api_key" and cfg.get("CURSOR_API_KEY"):
+        lines.append(f"CURSOR_API_KEY={cfg['CURSOR_API_KEY']}")
+    if cfg.get("CURSOR_AUTH_TOKEN"):
+        lines.append(f"CURSOR_AUTH_TOKEN={cfg['CURSOR_AUTH_TOKEN']}")
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def clear_runtime_auth_file(container_name: str) -> None:
+    path = AUTH_DIR / f"{container_name}.env"
+    if path.is_file():
+        path.unlink()
+
+
+def container_has_auth_mount(docker: str, name: str) -> bool:
+    if not container_exists(docker, name):
+        return False
+    try:
+        result = run(
+            docker,
+            ["inspect", name, "--format", "{{json .Mounts}}"],
+            capture=True,
+        )
+        mounts = json.loads(result.stdout or "[]")
+        return any(m.get("Destination") == RUNTIME_AUTH_CONTAINER_PATH for m in mounts)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+
+
+def sync_instance_auth_to_env(instance_id: str, record: dict) -> None:
+    data = load_instances()
+    if data.get("active") != instance_id:
+        return
+    if record.get("cursor_api_key"):
+        update_env_file("CURSOR_API_KEY", record["cursor_api_key"])
+    elif ENV_FILE.is_file():
+        update_env_file("CURSOR_API_KEY", "")
+
+
+def persist_instance_auth(
+    instance_id: str,
+    *,
+    auth_mode: str,
+    api_key: str = "",
+    auth_token: str = "",
+) -> dict[str, str]:
+    data = load_instances()
+    if instance_id not in data.get("instances", {}):
+        raise KeyError(f"Instância '{instance_id}' não encontrada.")
+    rec = data["instances"][instance_id]
+    rec["auth_mode"] = auth_mode
+    rec["cursor_api_key"] = api_key if auth_mode == "api_key" else ""
+    rec["cursor_auth_token"] = auth_token
+    save_instance_record(instance_id, rec)
+    sync_instance_auth_to_env(instance_id, rec)
+    cfg = get_instance_cfg(instance_id)
+    cfg["auth_mode"] = auth_mode
+    return cfg
+
+
+def clear_login_volumes(docker: str, container_name: str) -> None:
+    """Remove dados de agent login nos volumes (opcional ao migrar para API key)."""
+    home = auth_home_volume_name(container_name)
+    cfg = auth_config_volume_name(container_name)
+    print("[auth] Limpando sessão agent login nos volumes...")
+    run(
+        docker,
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{home}:/root/.cursor",
+            "-v",
+            f"{cfg}:/root/.config/cursor",
+            OFFICIAL_IMAGE,
+            "bash",
+            "-c",
+            "rm -rf /root/.cursor/* /root/.config/cursor/* 2>/dev/null || true",
+        ],
+        check=False,
+        timeout=60,
+    )
+
+
+def restart_worker_light(docker: str, cfg: dict[str, str]) -> bool:
+    """Aplica auth via arquivo montado + docker restart (sem docker rm)."""
+    name = cfg["CONTAINER_NAME"]
+    write_runtime_auth_file(cfg)
+
+    if not container_exists(docker, name):
+        print(f"[info] Container '{name}' não existe — use install ou start.")
+        return False
+
+    if not container_has_auth_mount(docker, name):
+        print(
+            "[aviso] Container antigo sem montagem de auth dinâmica. "
+            "Recriação única necessária (opção avançada no menu)."
+        )
+        return False
+
+    state = "reiniciando" if container_running(docker, name) else "iniciando"
+    print(f"[auth] {state.capitalize()} '{name}' para aplicar autenticação...")
+    try:
+        run(docker, ["restart", name], timeout=180)
+    except subprocess.CalledProcessError:
+        return False
+    print("[ok] Container reiniciado. Verifique: python install_kali.py logs -f")
+    return True
+
+
+def recreate_container_with_auth(docker: str, cfg: dict[str, str]) -> None:
+    """Recriação completa — só quando restart leve não é possível."""
+    stop_container(docker, cfg["CONTAINER_NAME"])
+    remove_container(docker, cfg["CONTAINER_NAME"])
+    start_container(docker, cfg)
+
+
+def apply_auth_change(
+    docker: str,
+    cfg: dict[str, str],
+    *,
+    instance_id: str = "",
+    force_recreate: bool = False,
+) -> bool:
+    write_runtime_auth_file(cfg)
+    if force_recreate:
+        recreate_container_with_auth(docker, cfg)
+        return True
+    if restart_worker_light(docker, cfg):
+        return True
+    if not is_interactive():
+        return False
+    ans = input("Recriar container (último recurso)? [s/N]: ").strip().lower()
+    if ans in ("s", "sim", "y", "yes"):
+        recreate_container_with_auth(docker, cfg)
+        return True
+    return False
+
+
+def flow_change_auth(docker: str, instance_id: str) -> None:
+    cfg = get_instance_cfg(instance_id)
+    mode = cfg.get("auth_mode") or ("api_key" if cfg.get("CURSOR_API_KEY") else "login")
+    print()
+    print("Alterar autenticação —", instance_id)
+    print(f"  Atual: {mode}")
+    print()
+    print("  [1] Atualizar API key (manter modo API key)")
+    print("  [2] Migrar para API key (desde login)")
+    print("  [3] Migrar para login no navegador (desde API key)")
+    print("  [0] Cancelar")
+    choice = input("\nEscolha: ").strip()
+    if choice == "0":
+        return
+
+    clear_login = False
+    if choice == "1":
+        try:
+            key = prompt_api_key()
+        except ValueError as exc:
+            print(f"Erro: {exc}")
+            return
+        cfg = persist_instance_auth(instance_id, auth_mode="api_key", api_key=key)
+    elif choice == "2":
+        clear_login = cli_ask("Limpar sessão login antiga nos volumes? [s/N]", "n").lower() in (
+            "s",
+            "sim",
+            "y",
+            "yes",
+        )
+        try:
+            key = prompt_api_key()
+        except ValueError as exc:
+            print(f"Erro: {exc}")
+            return
+        if clear_login:
+            clear_login_volumes(docker, cfg["CONTAINER_NAME"])
+        cfg = persist_instance_auth(instance_id, auth_mode="api_key", api_key=key)
+    elif choice == "3":
+        cfg = persist_instance_auth(instance_id, auth_mode="login", api_key="")
+        clear_runtime_auth_file(cfg["CONTAINER_NAME"])
+        if container_running(docker, cfg["CONTAINER_NAME"]):
+            print("[auth] Login interativo no container em execução...")
+            run(
+                docker,
+                [
+                    "exec",
+                    "-it",
+                    cfg["CONTAINER_NAME"],
+                    "bash",
+                    "-c",
+                    apt_bootstrap_snippet()
+                    + """
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
+  curl -fsSL https://cursor.com/install | bash
+fi
+exec "$AGENT_BIN" login
+""",
+                ],
+                check=False,
+            )
+        else:
+            ensure_image(docker, cfg["IMAGE_NAME"])
+            cmd_login(docker, cfg, quiet_success=True)
+    else:
+        print("Opção inválida.")
+        return
+
+    apply_auth_change(docker, cfg, instance_id=instance_id)
 
 
 def is_interactive() -> bool:
@@ -938,18 +1149,26 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         print(f"[ok] Container '{name}' já está em execução.")
         return
 
+    write_runtime_auth_file(cfg)
+
     if container_exists(docker, name):
-        print(f"[start] Recriando container '{name}' para aplicar configuração atual...")
+        if container_has_auth_mount(docker, name):
+            print(f"[start] Iniciando container existente '{name}'...")
+            run(docker, ["start", name], timeout=120)
+            return
+        print(
+            f"[start] Container '{name}' sem volume de auth dinâmica — recriando uma vez..."
+        )
         run(docker, ["rm", "-f", name], check=False)
 
     auth_home = auth_home_volume_name(name)
     auth_config = auth_config_volume_name(name)
-    env_file_args, env_file_cleanup = cursor_auth_env_file_args(cfg)
+    auth_mount = host_volume_path(str(runtime_auth_file_host(cfg)))
     cmd: list[str] = [
         "run",
         "-d",
         "--restart",
-        "unless-stopped",
+        DOCKER_RESTART_POLICY,
         "--name",
         name,
         "-v",
@@ -958,12 +1177,13 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
         f"{auth_home}:/root/.cursor",
         "-v",
         f"{auth_config}:/root/.config/cursor",
+        "-v",
+        f"{auth_mount}:{RUNTIME_AUTH_CONTAINER_PATH}:ro",
         "-e",
         f"WORKER_NAME={cfg['WORKER_NAME']}",
         "-e",
         f"CURSOR_WORKER_DIR={cfg['CURSOR_WORKER_DIR']}",
     ]
-    cmd.extend(env_file_args)
     if cfg.get("KALI_METAPACKAGE"):
         cmd.extend(["-e", f"KALI_METAPACKAGE={cfg['KALI_METAPACKAGE']}"])
     if uses_official_image(image):
@@ -985,11 +1205,7 @@ def start_container(docker: str, cfg: dict[str, str]) -> None:
     print(f"[run] Subindo container '{name}' (worker: {cfg['WORKER_NAME']})...")
     if uses_official_image(image):
         print(f"       Imagem: {image} (oficial Kali)")
-    try:
-        run(docker, cmd)
-    finally:
-        if env_file_cleanup is not None:
-            env_file_cleanup.unlink(missing_ok=True)
+    run(docker, cmd)
 
 
 def stop_container(docker: str, name: str) -> None:
@@ -1004,7 +1220,7 @@ def remove_container(docker: str, name: str) -> None:
     if not container_exists(docker, name):
         print(f"[info] Container '{name}' não existe.")
         return
-    run(docker, ["rm", "-f", name], check=False)
+    run(docker, ["rm", "-f", name], check=False, timeout=DOCKER_RM_TIMEOUT_SEC)
     print(f"[ok] Container '{name}' removido.")
 
 
@@ -1027,14 +1243,24 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
     print(f"Volume host  : {cfg['WORKER_DIR']} -> /workspace")
     if cfg.get("_instance_id"):
         print(f"Instância    : {cfg['_instance_id']}")
-    if cfg.get("CURSOR_API_KEY"):
-        auth_label = "API key (.env/CLI)"
+    mode = cfg.get("auth_mode") or ("api_key" if cfg.get("CURSOR_API_KEY") else "login")
+    if mode == "api_key" and cfg.get("CURSOR_API_KEY"):
+        auth_label = "API key (instances.json / .cursor-auth)"
     elif cfg.get("CURSOR_AUTH_TOKEN"):
         auth_label = "auth token"
+    elif mode == "login" and is_agent_authenticated(docker, cfg):
+        auth_label = "agent login (volume)"
+    elif mode == "login":
+        auth_label = "login (sessão pendente)"
     else:
-        auth_label = "agent login (volume)" if is_agent_authenticated(docker, cfg) else "(não autenticado)"
-    print(f"Autenticação : {auth_label}")
+        auth_label = "(não autenticado)"
+    print(f"Autenticação : {auth_label} [{mode}]")
+    auth_file = runtime_auth_file_host(cfg)
+    print(f"Auth runtime : {auth_file} -> {RUNTIME_AUTH_CONTAINER_PATH}")
     print(f"Volume auth  : {auth_home_volume_name(name)}, {auth_config_volume_name(name)}")
+    if container_exists(docker, name):
+        mount_ok = container_has_auth_mount(docker, name)
+        print(f"Auth dinâmica: {'sim (restart leve)' if mount_ok else 'não — recrie uma vez (install)'}")
     print()
     if container_running(docker, name):
         print(f"Status: EM EXECUÇÃO")
@@ -1043,6 +1269,82 @@ def show_status(docker: str, cfg: dict[str, str]) -> None:
         print("Status: PARADO (existe)")
     else:
         print("Status: NÃO CRIADO")
+
+
+def cmd_auth(docker: str, cfg: dict[str, str], args: argparse.Namespace) -> None:
+    """Troca API key ↔ login sem recriar container (docker restart por padrão)."""
+    instance_id = cfg.get("_instance_id", "") or getattr(args, "instance", None) or ""
+    force_recreate = bool(getattr(args, "recreate", False))
+    clear_login = bool(getattr(args, "clear_login", False))
+
+    if args.api_key:
+        if clear_login:
+            clear_login_volumes(docker, cfg["CONTAINER_NAME"])
+        if instance_id:
+            cfg = persist_instance_auth(instance_id, auth_mode="api_key", api_key=args.api_key)
+        else:
+            cfg = dict(cfg)
+            cfg["auth_mode"] = "api_key"
+            cfg["CURSOR_API_KEY"] = args.api_key
+            if ENV_FILE.is_file() or (ROOT / ".env.example").is_file():
+                update_env_file("CURSOR_API_KEY", args.api_key)
+            write_runtime_auth_file(cfg)
+        if not apply_auth_change(docker, cfg, instance_id=instance_id, force_recreate=force_recreate):
+            raise SystemExit(1)
+        return
+
+    if getattr(args, "auth_login", False):
+        if instance_id:
+            cfg = persist_instance_auth(instance_id, auth_mode="login", api_key="")
+        else:
+            cfg = dict(cfg)
+            cfg["auth_mode"] = "login"
+            cfg["CURSOR_API_KEY"] = ""
+            if ENV_FILE.is_file():
+                update_env_file("CURSOR_API_KEY", "")
+        clear_runtime_auth_file(cfg["CONTAINER_NAME"])
+        if not args.non_interactive:
+            if container_running(docker, cfg["CONTAINER_NAME"]):
+                print("[auth] Login interativo no container em execução...")
+                run(
+                    docker,
+                    [
+                        "exec",
+                        "-it",
+                        cfg["CONTAINER_NAME"],
+                        "bash",
+                        "-c",
+                        apt_bootstrap_snippet()
+                        + """
+AGENT_BIN="${AGENT_BIN:-/root/.local/bin/agent}"
+if ! [[ -x "$AGENT_BIN" ]] && ! command -v agent >/dev/null 2>&1; then
+  curl -fsSL https://cursor.com/install | bash
+fi
+exec "$AGENT_BIN" login
+""",
+                    ],
+                    check=False,
+                )
+            else:
+                ensure_image(docker, cfg["IMAGE_NAME"])
+                cmd_login(docker, cfg, quiet_success=True)
+        if not apply_auth_change(docker, cfg, instance_id=instance_id, force_recreate=force_recreate):
+            raise SystemExit(1)
+        return
+
+    if is_interactive():
+        if instance_id:
+            flow_change_auth(docker, instance_id)
+        else:
+            print("Erro: use -i <instância> ou defina instances.json para o menu de auth.")
+            raise SystemExit(1)
+        return
+
+    print(
+        "Erro: em modo não interativo use --api-key ou --login.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 def cmd_install(
@@ -1073,6 +1375,8 @@ Exemplos:
   python install_kali.py list
   python install_kali.py status -i lab-01
   python install_kali.py logs -f
+  python install_kali.py auth --api-key "$CURSOR_API_KEY" -i default
+  python install_kali.py auth --login -i lab-01
         """,
     )
     parser.add_argument(
@@ -1091,6 +1395,7 @@ Exemplos:
             "status",
             "logs",
             "login",
+            "auth",
             "list",
         ],
         help="Ação (sem argumento = menu interativo)",
@@ -1113,8 +1418,25 @@ Exemplos:
         "--worker-dir-in-container",
         help="Diretório dentro do container (padrão: /workspace)",
     )
-    parser.add_argument("--api-key", help="CURSOR_API_KEY para autenticação do worker")
+    parser.add_argument("--api-key", help="CURSOR_API_KEY (install/auth)")
     parser.add_argument("--auth-token", help="Token alternativo (CURSOR_AUTH_TOKEN)")
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        dest="auth_login",
+        help="Migrar para agent login (comando auth)",
+    )
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Recriar container ao aplicar auth (último recurso)",
+    )
+    parser.add_argument(
+        "--clear-login",
+        action="store_true",
+        dest="clear_login",
+        help="Limpar volumes de sessão login ao passar para API key",
+    )
     parser.add_argument(
         "--non-interactive",
         action="store_true",
@@ -1165,16 +1487,24 @@ def main() -> int:
     elif command == "login":
         ensure_image(docker, cfg["IMAGE_NAME"])
         cmd_login(docker, cfg)
+    elif command == "auth":
+        cmd_auth(docker, cfg, args)
     elif command == "start":
         cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
         start_container(docker, cfg)
     elif command == "stop":
         stop_container(docker, cfg["CONTAINER_NAME"])
     elif command == "restart":
-        stop_container(docker, cfg["CONTAINER_NAME"])
-        remove_container(docker, cfg["CONTAINER_NAME"])
-        cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
-        start_container(docker, cfg)
+        write_runtime_auth_file(cfg)
+        name = cfg["CONTAINER_NAME"]
+        if container_exists(docker, name) and container_has_auth_mount(docker, name):
+            if not restart_worker_light(docker, cfg):
+                raise SystemExit(1)
+        else:
+            stop_container(docker, name)
+            remove_container(docker, name)
+            cfg = ensure_authentication(docker, cfg, non_interactive=non_interactive)
+            start_container(docker, cfg)
     elif command == "remove":
         remove_container(docker, cfg["CONTAINER_NAME"])
     elif command == "status":

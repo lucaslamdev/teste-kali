@@ -108,6 +108,18 @@ Se não houver `CURSOR_API_KEY` nem login prévio, ao rodar `install` o script p
   [0] Cancelar
 ```
 
+### Trocar autenticação depois (sem recriar o container)
+
+Com o worker em execução, use o menu **Gerenciar instância → [7] Alterar autenticação** ou:
+
+```bash
+python install_kali.py auth -i default
+python install_kali.py auth --api-key "nova-chave" -i default
+python install_kali.py auth --login -i default
+```
+
+O script atualiza `instances.json` / `.cursor-auth/<container>.env` e reinicia o container com `docker restart`. Só recria o container se ele foi criado antes desta feature (sem volume `/run/cursor/auth.env`) ou se você passar `--recreate`.
+
 ---
 
 ## Passo 5 — Executar instalação automática
@@ -239,11 +251,23 @@ apt update && apt install -y kali-linux-headless
 
 ### Container reinicia em loop
 
+O entrypoint **não encerra mais** após falhas repetidas de auth — o container fica ativo para diagnóstico. A política Docker é `on-failure:2` (no máximo 2 reinícios automáticos).
+
 ```bash
 python install_kali.py logs
 ```
 
-Causas comuns: API key inválida, sem rede, ou `agent` falhou na instalação.
+Causas comuns do worker não subir:
+
+- **API key inválida ou sem permissão** — mensagem `liveness endpoint returned 404` nos logs
+- Sem rede para `api2.cursor.sh`
+- `agent` ainda instalando metapacote Kali (aguarde)
+
+Corrija a key e aplique sem recriar:
+
+```bash
+python install_kali.py auth --api-key "sua-chave" -i default
+```
 
 ### Refazer autenticação
 
