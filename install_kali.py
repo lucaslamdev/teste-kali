@@ -187,7 +187,7 @@ def print_instance_summary(docker: str, instance_id: str) -> None:
     rt = instance_runtime_status(docker, cfg)
     profile_label = KALI_PROFILES.get(cfg["KALI_PROFILE"], ("?", ""))[0]
     auth = "API key" if cfg.get("CURSOR_API_KEY") else (
-        "login (volume)" if is_agent_authenticated(docker, cfg) else "não configurado"
+        "login (volume)" if login_auth_volumes_populated(docker, cfg["CONTAINER_NAME"]) else "não configurado"
     )
     state = "EM EXECUÇÃO" if rt["running"] else ("PARADO" if rt["exists"] else "NÃO CRIADO")
     print(f"  [{instance_id}] {cfg['CONTAINER_NAME']} | worker={cfg['WORKER_NAME']}")
@@ -265,13 +265,13 @@ def flow_create_instance(docker: str) -> None:
         except ValueError as exc:
             print(f"Erro: {exc}")
             return
-        record["cursor_api_key"] = cfg["CURSOR_API_KEY"]
         record["auth_mode"] = "api_key"
-        save_instance_record(iid, record)
+        save_key = not is_interactive()
         if is_interactive():
             ans = input("Salvar API key nesta instância (instances.json)? [S/n]: ").strip().lower()
-            if ans in ("", "s", "sim", "y", "yes"):
-                pass  # já salvo em record
+            save_key = ans in ("", "s", "sim", "y", "yes")
+        record["cursor_api_key"] = cfg["CURSOR_API_KEY"] if save_key else ""
+        save_instance_record(iid, record)
     else:
         ensure_image(docker, cfg["IMAGE_NAME"])
         cmd_login(docker, cfg, quiet_success=True)
@@ -396,7 +396,19 @@ def flow_import_orphan(docker: str) -> None:
         print("Índice inválido.")
         return
     cname = orphans[idx]
-    iid = cli_ask("ID para esta instância", cname.replace("kali-", "", 1) or "imported")
+    existing = list_instance_ids()
+    default_iid = cname.replace("kali-", "", 1) or "imported"
+    while True:
+        raw = cli_ask("ID para esta instância", default_iid)
+        slug = re.sub(r"[^a-z0-9-]", "-", raw.lower()).strip("-")
+        if not slug:
+            print("ID inválido.")
+            continue
+        if slug in existing:
+            print(f"ID '{slug}' já existe.")
+            continue
+        iid = slug
+        break
     env = container_env_map(docker, cname)
     record = {
         "id": iid,
@@ -642,6 +654,28 @@ def auth_config_volume_name(container_name: str) -> str:
 
 def auth_volume_name(container_name: str) -> str:
     return auth_home_volume_name(container_name)
+
+
+def login_auth_volumes_populated(docker: str, container_name: str) -> bool:
+    """Verifica se volumes de login têm conteúdo (sem subir container Kali)."""
+    for vol in (auth_home_volume_name(container_name), auth_config_volume_name(container_name)):
+        result = run(
+            docker,
+            ["volume", "inspect", "-f", "{{.Mountpoint}}", vol],
+            capture=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        mount = Path((result.stdout or "").strip())
+        if not mount.is_dir():
+            continue
+        try:
+            if any(mount.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def is_interactive() -> bool:
